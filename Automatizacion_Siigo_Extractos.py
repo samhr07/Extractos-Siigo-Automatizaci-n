@@ -1,190 +1,216 @@
 import pandas as pd
-import re
-from thefuzz import process, fuzz
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.ticker import FuncFormatter
 
 # ------------------------------------------------------------
-# 1. LISTA DE PROVEEDORES CONOCIDOS (con variantes)
-#    Se incluyen los que mencionaste + los que se infieren de la info anterior
+# 1. CONFIGURACIÓN DEL INFORME
 # ------------------------------------------------------------
-PROVEEDORES_CONOCIDOS = [
-    "protoquimica",  # Calcio, magnesio, potasio
-    "tecna",  # Extracto de levadura
-    "incodi",  # Unidades de envase, cristalería
-    "ara",  # Supermercado
-    "d1",  # Supermercado
-    "exito",  # Supermercado
-    "frutesa",  # Cliente que paga quincenalmente (ingresos)
-    "wompi",  # Pasarela de pagos (posible)
-    "bancolombia",  # Comisiones bancarias
-    "nequi",  # Comisiones
-    "nu",  # Comisiones
-]
+# Asumimos que df tiene columnas: 'banco', 'monto', 'fecha', 'descripcion' (opcional)
+# 'banco' debe ser una cadena con el nombre del banco: "Bancolombia", "Nequi", "Nu", "Davivienda", etc.
 
 
 # ------------------------------------------------------------
-# 2. FUNCIÓN PRINCIPAL DE EXTRACCIÓN DE PROVEEDOR
+# 2. FUNCIÓN PARA GENERAR INFORME DE BANCOS
 # ------------------------------------------------------------
-def extraer_proveedor(descripcion, monto):
+def generar_informe_bancos(df):
     """
-    Extrae el nombre del proveedor/lugar de compra a partir de la descripción.
-    Para egresos (monto < 0) busca proveedores de compra.
-    Para ingresos (monto > 0) detecta si es Frutesa u otro cliente.
-    Retorna el nombre del proveedor o "Desconocido" si no encuentra.
+    Genera un informe detallado de transacciones por banco.
+    Retorna un DataFrame con el resumen y guarda gráficos.
     """
-    if not isinstance(descripcion, str) or pd.isna(descripcion):
-        return "Desconocido"
+    # Copia para no modificar el original
+    data = df.copy()
 
-    desc_lower = descripcion.lower()
-    es_egreso = monto < 0  # Monto negativo indica compra o gasto
-    es_ingreso = monto > 0  # Monto positivo indica ingreso
+    # Asegurar que la columna banco esté en mayúscula primera letra para uniformidad
+    data["banco"] = data["banco"].str.title()
 
-    # ------------------------------------------------------------
-    # A. ESTRATEGIA 1: Coincidencia difusa con proveedores conocidos
-    # ------------------------------------------------------------
-    # Buscamos el mejor match dentro de la lista de proveedores
-    # Usamos partial_ratio para capturar "PROTOQUIMICA" dentro de "PAGO A PROTOQUIMICA"
-    mejor_match = process.extractOne(
-        desc_lower, PROVEEDORES_CONOCIDOS, scorer=fuzz.partial_ratio
-    )
-
-    if mejor_match and mejor_match[1] >= 80:
-        proveedor = mejor_match[0]
-        # Si es ingreso y el proveedor es "frutesa", lo dejamos; si es otro, podría ser cliente.
-        if es_ingreso and proveedor != "frutesa":
-            # Para ingresos, si no es Frutesa, podría ser otro cliente, pero para este informe
-            # de compras solo nos interesa egresos. De todas formas, lo etiquetamos.
-            return f"Cliente: {proveedor.title()}"
-        elif es_egreso:
-            # Para egresos, devolvemos el proveedor con formato título
-            return proveedor.title()
-        else:
-            return proveedor.title()
+    # Identificar ingresos y egresos
+    data["tipo"] = data["monto"].apply(lambda x: "Ingreso" if x > 0 else "Egreso")
+    data["monto_abs"] = data["monto"].abs()
 
     # ------------------------------------------------------------
-    # B. ESTRATEGIA 2: Patrones comunes en descripciones de compras
+    # 2.1. Resumen general por banco (todas las transacciones)
     # ------------------------------------------------------------
-    # Buscamos patrones como: "PAGO A ...", "COMPRA EN ...", "TRANSFERENCIA A ..."
-    # Solo aplica a egresos (compras)
-    if es_egreso:
-        patrones = [
-            r"(?:pago\s*a\s*)([a-záéíóúñ\s]+?)(?:\s*ref|\s*$|\.|,)",
-            r"(?:compra\s*en\s*)([a-záéíóúñ\s]+?)(?:\s*ref|\s*$|\.|,)",
-            r"(?:transferencia\s*a\s*)([a-záéíóúñ\s]+?)(?:\s*ref|\s*$|\.|,)",
-            r"(?:pago\s*proveedor\s*)([a-záéíóúñ\s]+?)(?:\s*ref|\s*$|\.|,)",
-        ]
-        for patron in patrones:
-            match = re.search(patron, desc_lower)
-            if match:
-                proveedor_extraido = match.group(1).strip()
-                # Limpiamos posibles palabras sobrantes
-                proveedor_extraido = re.sub(r"\s+ref\s+\d+", "", proveedor_extraido)
-                if len(proveedor_extraido) > 2 and proveedor_extraido not in [
-                    "pago",
-                    "compra",
-                    "transferencia",
-                ]:
-                    return proveedor_extraido.title()
-
-    # ------------------------------------------------------------
-    # C. ESTRATEGIA 3: Inferencia a partir de palabras clave (usando el diccionario del punto #1)
-    #    Si la descripción contiene "extracto levadura", deducimos "Tecna"
-    #    Si contiene "calcio", deducimos "Protoquímica", etc.
-    # ------------------------------------------------------------
-    if es_egreso:
-        # Mapeo de palabras clave a proveedores (basado en la info que me diste)
-        mapa_keyword_proveedor = {
-            "protoquimica": "Protoquímica",
-            "calcio": "Protoquímica",
-            "magnesio": "Protoquímica",
-            "potasio": "Protoquímica",
-            "costal": "Protoquímica",
-            "tecna": "Tecna",
-            "levadura": "Tecna",
-            "incodi": "Incodi",
-            "envase": "Incodi",
-            "cristalería": "Incodi",
-            "ara": "Supermercado Ara",
-            "d1": "Supermercado D1",
-            "exito": "Supermercado Éxito",
-            "panela": "Supermercado",
-            "alcohol": "Proveedor Químico",
-            "hipoclorito": "Proveedor Químico",
-            "ozono": "Proveedor Químico",
-        }
-        for keyword, proveedor in mapa_keyword_proveedor.items():
-            if keyword in desc_lower:
-                return proveedor
-
-    # ------------------------------------------------------------
-    # D. ESTRATEGIA 4: Para ingresos, detectar Frutesa (si no se capturó antes)
-    # ------------------------------------------------------------
-    if es_ingreso and ("frutesa" in desc_lower or "frut" in desc_lower):
-        return "Frutesa (Ingreso)"
-
-    # ------------------------------------------------------------
-    # E. Si no se pudo extraer nada
-    # ------------------------------------------------------------
-    return "Desconocido"
-
-
-# ------------------------------------------------------------
-# 3. APLICACIÓN AL DATAFRAME
-# ------------------------------------------------------------
-# Suponemos que df tiene columnas: 'descripcion' y 'monto'
-# df = pd.read_csv('tus_extractos.csv')  # <-- Descomenta
-
-# Aplicar extracción
-df["proveedor"] = df.apply(
-    lambda row: extraer_proveedor(row["descripcion"], row["monto"]), axis=1
-)
-
-# ------------------------------------------------------------
-# 4. GENERAR INFORME DE LUGARES DE COMPRA (SOLO EGRESOS)
-# ------------------------------------------------------------
-# Filtramos solo las transacciones de egreso (compras)
-compras_df = df[df["monto"] < 0].copy()
-
-# Agrupamos por proveedor
-reporte_proveedores = (
-    compras_df.groupby("proveedor")
-    .agg(
-        total_comprado=("monto", lambda x: abs(x.sum())),  # Monto absoluto total
-        num_compras=("monto", "count"),
-        promedio_compra=("monto", lambda x: abs(x.mean())),
-    )
-    .reset_index()
-    .sort_values("total_comprado", ascending=False)
-)
-
-# Agregamos columna de porcentaje sobre el total de compras
-total_general = reporte_proveedores["total_comprado"].sum()
-reporte_proveedores["%_participacion"] = (
-    reporte_proveedores["total_comprado"] / total_general * 100
-).round(2)
-
-# ------------------------------------------------------------
-# 5. VISUALIZACIÓN Y EXPORTACIÓN
-# ------------------------------------------------------------
-print("🏢 INFORME DE LUGARES DE COMPRA (PROVEEDORES)")
-print("=============================================")
-print(reporte_proveedores.to_string(index=False))
-
-# Exportar a Excel para análisis
-with pd.ExcelWriter("informe_proveedores.xlsx") as writer:
-    reporte_proveedores.to_excel(writer, sheet_name="Proveedores", index=False)
-    # Hoja adicional con todas las compras detalladas
-    compras_df[["fecha", "descripcion", "monto", "proveedor"]].to_excel(
-        writer, sheet_name="Detalle Compras", index=False
-    )
-
-# Además, si quieres ver proveedores en ingresos (ej. Frutesa)
-ingresos_df = df[df["monto"] > 0].copy()
-if not ingresos_df.empty:
-    print("\n📈 CLIENTES QUE GENERAN INGRESOS:")
-    clientes_report = (
-        ingresos_df.groupby("proveedor")
-        .agg(total_ingreso=("monto", "sum"), num_ingresos=("monto", "count"))
+    resumen_general = (
+        data.groupby("banco")
+        .agg(
+            total_transacciones=("monto", "count"),
+            total_monto=("monto_abs", "sum"),
+            monto_promedio=("monto_abs", "mean"),
+        )
         .reset_index()
-        .sort_values("total_ingreso", ascending=False)
+        .sort_values("total_monto", ascending=False)
     )
-    print(clientes_report.to_string(index=False))
+
+    # Calcular participación porcentual
+    total_monto_general = resumen_general["total_monto"].sum()
+    resumen_general["%_participacion_monto"] = (
+        resumen_general["total_monto"] / total_monto_general * 100
+    ).round(2)
+    resumen_general["%_participacion_transacciones"] = (
+        resumen_general["total_transacciones"]
+        / resumen_general["total_transacciones"].sum()
+        * 100
+    ).round(2)
+
+    # ------------------------------------------------------------
+    # 2.2. Desglose por tipo (Ingreso/Egreso)
+    # ------------------------------------------------------------
+    resumen_por_tipo = (
+        data.groupby(["banco", "tipo"])
+        .agg(total_monto=("monto_abs", "sum"), transacciones=("monto", "count"))
+        .reset_index()
+    )
+
+    # Pivot para tener una tabla ancha (más fácil de leer)
+    pivot_monto = resumen_por_tipo.pivot(
+        index="banco", columns="tipo", values="total_monto"
+    ).fillna(0)
+    pivot_transacciones = resumen_por_tipo.pivot(
+        index="banco", columns="tipo", values="transacciones"
+    ).fillna(0)
+
+    # Calcular ratio ingreso/egreso por banco (monto)
+    pivot_monto["ratio_ingreso_egreso"] = pivot_monto["Ingreso"] / pivot_monto[
+        "Egreso"
+    ].replace(
+        0, 1
+    )  # evitar división por cero
+
+    # ------------------------------------------------------------
+    # 2.3. Crear gráficos
+    # ------------------------------------------------------------
+    # Configuración de estilo
+    sns.set_style("whitegrid")
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(
+        "📊 Informe de Transacciones por Banco", fontsize=16, fontweight="bold"
+    )
+
+    # Gráfico 1: Distribución de montos por banco (pastel)
+    ax1 = axes[0, 0]
+    colores = sns.color_palette("Set3", len(resumen_general))
+    wedges, texts, autotexts = ax1.pie(
+        resumen_general["total_monto"],
+        labels=resumen_general["banco"],
+        autopct=lambda p: f"{p:.1f}%",
+        startangle=90,
+        colors=colores,
+        explode=[0.02] * len(resumen_general),
+        shadow=True,
+    )
+    ax1.set_title("Distribución de Montos por Banco")
+
+    # Gráfico 2: Número de transacciones por banco (barras)
+    ax2 = axes[0, 1]
+    sns.barplot(
+        data=resumen_general,
+        x="banco",
+        y="total_transacciones",
+        palette="viridis",
+        ax=ax2,
+    )
+    ax2.set_title("Número de Transacciones por Banco")
+    ax2.set_ylabel("Número de transacciones")
+    ax2.set_xlabel("Banco")
+    for p in ax2.patches:
+        ax2.annotate(
+            f"{int(p.get_height())}",
+            (p.get_x() + p.get_width() / 2.0, p.get_height() + 0.5),
+            ha="center",
+            va="bottom",
+            fontsize=10,
+        )
+
+    # Gráfico 3: Monto promedio por banco (barras horizontales)
+    ax3 = axes[1, 0]
+    resumen_general_sorted = resumen_general.sort_values(
+        "monto_promedio", ascending=True
+    )
+    sns.barplot(
+        data=resumen_general_sorted,
+        y="banco",
+        x="monto_promedio",
+        palette="coolwarm",
+        ax=ax3,
+    )
+    ax3.set_title("Monto Promedio por Transacción")
+    ax3.set_xlabel("Monto promedio (COP)")
+    ax3.set_ylabel("Banco")
+    ax3.xaxis.set_major_formatter(FuncFormatter(lambda x, p: f"${x:,.0f}"))
+
+    # Gráfico 4: Ingresos vs Egresos por banco (barras agrupadas)
+    ax4 = axes[1, 1]
+    # Preparar datos para barras agrupadas
+    pivot_monto_plot = pivot_monto[["Ingreso", "Egreso"]].fillna(0)
+    pivot_monto_plot.plot(kind="bar", ax=ax4, color=["green", "red"], alpha=0.7)
+    ax4.set_title("Montos de Ingresos vs Egresos por Banco")
+    ax4.set_ylabel("Monto total (COP)")
+    ax4.set_xlabel("Banco")
+    ax4.legend(title="Tipo")
+    ax4.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f"${x:,.0f}"))
+    ax4.grid(axis="y", linestyle="--", alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig("informe_bancos.png", dpi=150, bbox_inches="tight")
+    plt.show()
+
+    # ------------------------------------------------------------
+    # 2.4. Exportar a Excel con múltiples hojas
+    # ------------------------------------------------------------
+    with pd.ExcelWriter("informe_bancos.xlsx") as writer:
+        resumen_general.to_excel(writer, sheet_name="Resumen General", index=False)
+        pivot_monto.to_excel(writer, sheet_name="Ingresos vs Egresos (Monto)")
+        pivot_transacciones.to_excel(writer, sheet_name="Ingresos vs Egresos (Nº)")
+        # Hoja adicional con el detalle de cada transacción (opcional)
+        data[["fecha", "banco", "descripcion", "monto", "tipo"]].to_excel(
+            writer, sheet_name="Detalle Transacciones", index=False
+        )
+
+    # ------------------------------------------------------------
+    # 2.5. Imprimir resumen en consola
+    # ------------------------------------------------------------
+    print("🏦 INFORME DE BANCOS DE TRANSACCIÓN")
+    print("===================================")
+    print(resumen_general.to_string(index=False))
+    print("\n📊 Distribución de Ingresos vs Egresos (por monto):")
+    print(
+        pivot_monto[["Ingreso", "Egreso", "ratio_ingreso_egreso"]].round(2).to_string()
+    )
+
+    return resumen_general, pivot_monto
+
+
+# ------------------------------------------------------------
+# 3. EJEMPLO DE USO (ASUMIENDO QUE TIENES df CON COLUMNA 'banco')
+# ------------------------------------------------------------
+# df = pd.read_csv('tus_extractos.csv')  # <-- descomenta y ajusta
+# resumen, pivot = generar_informe_bancos(df)
+
+
+# ------------------------------------------------------------
+# 4. (OPCIONAL) FUNCIÓN PARA INFERIR BANCO A PARTIR DE DESCRIPCIÓN
+#    Útil si no tienes la columna 'banco' y quieres asignarla automáticamente
+# ------------------------------------------------------------
+def inferir_banco(descripcion):
+    """
+    Infiere el banco a partir de la descripción de la transacción.
+    Retorna el nombre del banco o 'Otro'.
+    """
+    desc_lower = str(descripcion).lower()
+    if "bancolombia" in desc_lower:
+        return "Bancolombia"
+    elif "nequi" in desc_lower:
+        return "Nequi"
+    elif "nu" in desc_lower or "nubank" in desc_lower:
+        return "Nu"
+    elif "davivienda" in desc_lower:
+        return "Davivienda"
+    else:
+        return "Otro"
+
+
+# Ejemplo de cómo asignar 'banco' si no existe
+# if 'banco' not in df.columns:
+#     df['banco'] = df['descripcion'].apply(inferir_banco)
+#     print("✅ Columna 'banco' inferida automáticamente.")
