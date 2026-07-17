@@ -1,195 +1,190 @@
 import pandas as pd
+import re
 from thefuzz import process, fuzz
 
 # ------------------------------------------------------------
-# 1. DEFINICIÓN DE CATEGORÍAS (expansión solicitada)
+# 1. LISTA DE PROVEEDORES CONOCIDOS (con variantes)
+#    Se incluyen los que mencionaste + los que se infieren de la info anterior
 # ------------------------------------------------------------
-CATEGORIAS = [
-    "Materia Prima",
-    "Servicios Públicos",  # Agua, luz, gas, etc.
-    "Nómina",
-    "Gastos Administrativos",  # Papelería, mensajería, oficina
-    "Ventas",  # Ingresos por consignaciones
-    "Impuestos",  # GMF, 4x1000, Retefuente
-    "Otros",  # Catch-all por defecto
-    "Biocompuestos",  # Extracto de levadura, etc.
-    "Inorgánicos",  # Calcio, magnesio, hipoclorito, ozono, cristalería
+PROVEEDORES_CONOCIDOS = [
+    "protoquimica",  # Calcio, magnesio, potasio
+    "tecna",  # Extracto de levadura
+    "incodi",  # Unidades de envase, cristalería
+    "ara",  # Supermercado
+    "d1",  # Supermercado
+    "exito",  # Supermercado
+    "frutesa",  # Cliente que paga quincenalmente (ingresos)
+    "wompi",  # Pasarela de pagos (posible)
+    "bancolombia",  # Comisiones bancarias
+    "nequi",  # Comisiones
+    "nu",  # Comisiones
 ]
 
-# ------------------------------------------------------------
-# 2. DICCIONARIO DE PALABRAS CLAVE POR CATEGORÍA
-#    (Todas en minúsculas para facilitar la búsqueda)
-# ------------------------------------------------------------
-CATEGORY_KEYWORDS = {
-    # --- INORGÁNICOS (Minerales, químicos de desinfección y vidriería) ---
-    "Inorgánicos": [
-        "calcio",
-        "magnesio",
-        "potasio",
-        "costal",
-        "costales",  # Relacionado con la presentación de estos
-        "protoquímica",  # Proveedor de estos insumos
-        "alcohol",
-        "hipoclorito",
-        "ozono",  # Solicitado explícitamente para desinfección
-        "cristalería",
-        "laboratorio",
-        "matraz",
-        "probeta",
-        "tubo de ensayo",
-        "vidrio",
-        "pipeta",
-        "bureta",
-    ],
-    # --- BIOCOMPUESTOS (Levaduras y derivados biológicos) ---
-    "Biocompuestos": [
-        "extracto de levadura",
-        "levadura",
-        "tecna",  # Proveedor específico de levadura
-        "biocompuesto",
-        "peptona",  # (Común en medios de cultivo)
-        "agar",  # (Común en microbiología)
-    ],
-    # --- MATERIA PRIMA (Insumos generales de producción) ---
-    "Materia Prima": [
-        "panela",
-        "ara",
-        "d1",
-        "éxito",  # Supermercados
-        "supermercado",
-        "envase",
-        "envases",
-        "incodi",  # Proveedor de envases
-        "insumo",
-        "producción",
-        "melaza",
-        "azúcar",  # Posibles otros insumos
-    ],
-    # --- NÓMINA (Empleados y prestaciones) ---
-    "Nómina": [
-        "william",
-        "alexander",
-        "mábel",
-        "mabel",
-        "bolivar",
-        "hugo",
-        "diana",
-        "salario",
-        "sueldo",
-        "prestaciones",
-        "nómina",
-        "seguridad social",
-        "arl",
-        "cesantías",
-        "prima",
-        "vacaciones",
-    ],
-    # --- SERVICIOS PÚBLICOS ---
-    "Servicios Públicos": [
-        "agua",
-        "luz",
-        "electricidad",
-        "gas",
-        "telefonía",
-        "internet",
-        "acueducto",
-        "alcantarillado",
-        "aseo",
-    ],
-    # --- GASTOS ADMINISTRATIVOS ---
-    "Gastos Administrativos": [
-        "papelería",
-        "oficina",
-        "tinta",
-        "mensajería",
-        "transporte",
-        "resma",
-        "caja",
-        "grapas",
-    ],
-    # --- IMPUESTOS ---
-    "Impuestos": [
-        "4x1000",
-        "gmf",
-        "gravamen",
-        "iva",
-        "renta",
-        "retefuente",
-        "reteica",
-        "reteiva",
-    ],
-    # --- VENTAS (Ingresos) ---
-    "Ventas": [
-        "facturación",
-        "cliente",
-        "venta",
-        "ingreso",
-        "consignación",
-        "recibo",
-        "pago cliente",
-    ],
-}
 
 # ------------------------------------------------------------
-# 3. PREPARACIÓN DE LA ESTRUCTURA PARA BÚSQUEDA RÁPIDA
+# 2. FUNCIÓN PRINCIPAL DE EXTRACCIÓN DE PROVEEDOR
 # ------------------------------------------------------------
-# Aplanamos todas las palabras clave y mapeamos a su categoría
-all_keywords = []
-keyword_to_category = {}
-
-for categoria, lista_palabras in CATEGORY_KEYWORDS.items():
-    for palabra in lista_palabras:
-        kw_lower = palabra.lower().strip()
-        if kw_lower not in keyword_to_category:  # Evita duplicados
-            all_keywords.append(kw_lower)
-            keyword_to_category[kw_lower] = categoria
-
-
-# ------------------------------------------------------------
-# 4. FUNCIÓN DE CLASIFICACIÓN CON COINCIDENCIA DIFUSA (FUZZY)
-# ------------------------------------------------------------
-def clasificar_transaccion(descripcion, umbral=80):
+def extraer_proveedor(descripcion, monto):
     """
-    Clasifica una descripción usando fuzzy matching (coincidencia difusa).
-    Retorna la categoría si encuentra una keyword con similitud >= umbral.
-    Si no, retorna "Otros".
-
-    Args:
-        descripcion (str): Texto de la transacción (ej. "PAGO A PROTOQUIMICA CALCIO").
-        umbral (int): Porcentaje mínimo de similitud (0-100). Recomendado 80.
+    Extrae el nombre del proveedor/lugar de compra a partir de la descripción.
+    Para egresos (monto < 0) busca proveedores de compra.
+    Para ingresos (monto > 0) detecta si es Frutesa u otro cliente.
+    Retorna el nombre del proveedor o "Desconocido" si no encuentra.
     """
-    # Validación de entrada
     if not isinstance(descripcion, str) or pd.isna(descripcion):
-        return "Otros"
+        return "Desconocido"
 
     desc_lower = descripcion.lower()
+    es_egreso = monto < 0  # Monto negativo indica compra o gasto
+    es_ingreso = monto > 0  # Monto positivo indica ingreso
 
-    # Extraer la mejor coincidencia usando partial_ratio (bueno para subcadenas)
-    # Ej: "PROTOQUIMICA" se encuentra dentro de "PAGO A PROTOQUIMICA CALCIO"
+    # ------------------------------------------------------------
+    # A. ESTRATEGIA 1: Coincidencia difusa con proveedores conocidos
+    # ------------------------------------------------------------
+    # Buscamos el mejor match dentro de la lista de proveedores
+    # Usamos partial_ratio para capturar "PROTOQUIMICA" dentro de "PAGO A PROTOQUIMICA"
     mejor_match = process.extractOne(
-        desc_lower, all_keywords, scorer=fuzz.partial_ratio
+        desc_lower, PROVEEDORES_CONOCIDOS, scorer=fuzz.partial_ratio
     )
 
-    # Si hay match y supera el umbral, asignamos la categoría
-    if mejor_match and mejor_match[1] >= umbral:
-        keyword_encontrada = mejor_match[0]
-        return keyword_to_category.get(keyword_encontrada, "Otros")
-    else:
-        return "Otros"
+    if mejor_match and mejor_match[1] >= 80:
+        proveedor = mejor_match[0]
+        # Si es ingreso y el proveedor es "frutesa", lo dejamos; si es otro, podría ser cliente.
+        if es_ingreso and proveedor != "frutesa":
+            # Para ingresos, si no es Frutesa, podría ser otro cliente, pero para este informe
+            # de compras solo nos interesa egresos. De todas formas, lo etiquetamos.
+            return f"Cliente: {proveedor.title()}"
+        elif es_egreso:
+            # Para egresos, devolvemos el proveedor con formato título
+            return proveedor.title()
+        else:
+            return proveedor.title()
+
+    # ------------------------------------------------------------
+    # B. ESTRATEGIA 2: Patrones comunes en descripciones de compras
+    # ------------------------------------------------------------
+    # Buscamos patrones como: "PAGO A ...", "COMPRA EN ...", "TRANSFERENCIA A ..."
+    # Solo aplica a egresos (compras)
+    if es_egreso:
+        patrones = [
+            r"(?:pago\s*a\s*)([a-záéíóúñ\s]+?)(?:\s*ref|\s*$|\.|,)",
+            r"(?:compra\s*en\s*)([a-záéíóúñ\s]+?)(?:\s*ref|\s*$|\.|,)",
+            r"(?:transferencia\s*a\s*)([a-záéíóúñ\s]+?)(?:\s*ref|\s*$|\.|,)",
+            r"(?:pago\s*proveedor\s*)([a-záéíóúñ\s]+?)(?:\s*ref|\s*$|\.|,)",
+        ]
+        for patron in patrones:
+            match = re.search(patron, desc_lower)
+            if match:
+                proveedor_extraido = match.group(1).strip()
+                # Limpiamos posibles palabras sobrantes
+                proveedor_extraido = re.sub(r"\s+ref\s+\d+", "", proveedor_extraido)
+                if len(proveedor_extraido) > 2 and proveedor_extraido not in [
+                    "pago",
+                    "compra",
+                    "transferencia",
+                ]:
+                    return proveedor_extraido.title()
+
+    # ------------------------------------------------------------
+    # C. ESTRATEGIA 3: Inferencia a partir de palabras clave (usando el diccionario del punto #1)
+    #    Si la descripción contiene "extracto levadura", deducimos "Tecna"
+    #    Si contiene "calcio", deducimos "Protoquímica", etc.
+    # ------------------------------------------------------------
+    if es_egreso:
+        # Mapeo de palabras clave a proveedores (basado en la info que me diste)
+        mapa_keyword_proveedor = {
+            "protoquimica": "Protoquímica",
+            "calcio": "Protoquímica",
+            "magnesio": "Protoquímica",
+            "potasio": "Protoquímica",
+            "costal": "Protoquímica",
+            "tecna": "Tecna",
+            "levadura": "Tecna",
+            "incodi": "Incodi",
+            "envase": "Incodi",
+            "cristalería": "Incodi",
+            "ara": "Supermercado Ara",
+            "d1": "Supermercado D1",
+            "exito": "Supermercado Éxito",
+            "panela": "Supermercado",
+            "alcohol": "Proveedor Químico",
+            "hipoclorito": "Proveedor Químico",
+            "ozono": "Proveedor Químico",
+        }
+        for keyword, proveedor in mapa_keyword_proveedor.items():
+            if keyword in desc_lower:
+                return proveedor
+
+    # ------------------------------------------------------------
+    # D. ESTRATEGIA 4: Para ingresos, detectar Frutesa (si no se capturó antes)
+    # ------------------------------------------------------------
+    if es_ingreso and ("frutesa" in desc_lower or "frut" in desc_lower):
+        return "Frutesa (Ingreso)"
+
+    # ------------------------------------------------------------
+    # E. Si no se pudo extraer nada
+    # ------------------------------------------------------------
+    return "Desconocido"
 
 
 # ------------------------------------------------------------
-# 5. APLICACIÓN AL DATAFRAME (EJEMPLO)
+# 3. APLICACIÓN AL DATAFRAME
 # ------------------------------------------------------------
-# ASUNTO: Suponemos que tienes un DataFrame `df` con una columna 'descripcion'
-# df = pd.read_csv('tus_extractos.csv')  # <-- Descomenta y ajusta según tu fuente
+# Suponemos que df tiene columnas: 'descripcion' y 'monto'
+# df = pd.read_csv('tus_extractos.csv')  # <-- Descomenta
 
-# Aplicar la clasificación a cada fila
-# df['categoria'] = df['descripcion'].apply(clasificar_transaccion)
+# Aplicar extracción
+df["proveedor"] = df.apply(
+    lambda row: extraer_proveedor(row["descripcion"], row["monto"]), axis=1
+)
 
-# Visualizar la distribución para validar que todo funciona
-# print("Distribución de categorías asignadas:")
-# print(df['categoria'].value_counts())
+# ------------------------------------------------------------
+# 4. GENERAR INFORME DE LUGARES DE COMPRA (SOLO EGRESOS)
+# ------------------------------------------------------------
+# Filtramos solo las transacciones de egreso (compras)
+compras_df = df[df["monto"] < 0].copy()
 
-# Exportar resultados si deseas revisar manualmente
-# df[['fecha', 'descripcion', 'monto', 'categoria']].to_excel('extractos_clasificados.xlsx', index=False)
+# Agrupamos por proveedor
+reporte_proveedores = (
+    compras_df.groupby("proveedor")
+    .agg(
+        total_comprado=("monto", lambda x: abs(x.sum())),  # Monto absoluto total
+        num_compras=("monto", "count"),
+        promedio_compra=("monto", lambda x: abs(x.mean())),
+    )
+    .reset_index()
+    .sort_values("total_comprado", ascending=False)
+)
+
+# Agregamos columna de porcentaje sobre el total de compras
+total_general = reporte_proveedores["total_comprado"].sum()
+reporte_proveedores["%_participacion"] = (
+    reporte_proveedores["total_comprado"] / total_general * 100
+).round(2)
+
+# ------------------------------------------------------------
+# 5. VISUALIZACIÓN Y EXPORTACIÓN
+# ------------------------------------------------------------
+print("🏢 INFORME DE LUGARES DE COMPRA (PROVEEDORES)")
+print("=============================================")
+print(reporte_proveedores.to_string(index=False))
+
+# Exportar a Excel para análisis
+with pd.ExcelWriter("informe_proveedores.xlsx") as writer:
+    reporte_proveedores.to_excel(writer, sheet_name="Proveedores", index=False)
+    # Hoja adicional con todas las compras detalladas
+    compras_df[["fecha", "descripcion", "monto", "proveedor"]].to_excel(
+        writer, sheet_name="Detalle Compras", index=False
+    )
+
+# Además, si quieres ver proveedores en ingresos (ej. Frutesa)
+ingresos_df = df[df["monto"] > 0].copy()
+if not ingresos_df.empty:
+    print("\n📈 CLIENTES QUE GENERAN INGRESOS:")
+    clientes_report = (
+        ingresos_df.groupby("proveedor")
+        .agg(total_ingreso=("monto", "sum"), num_ingresos=("monto", "count"))
+        .reset_index()
+        .sort_values("total_ingreso", ascending=False)
+    )
+    print(clientes_report.to_string(index=False))
