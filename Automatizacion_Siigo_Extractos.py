@@ -1,216 +1,146 @@
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from matplotlib.ticker import FuncFormatter
+import re
 
 # ------------------------------------------------------------
-# 1. CONFIGURACIÓN DEL INFORME
+# 1. DICCIONARIO DE EMPLEADOS CON SUS NÚMEROS
+#    (Nequi: números de celular de 10 dígitos; Bancolombia: números de cuenta de 11 dígitos)
 # ------------------------------------------------------------
-# Asumimos que df tiene columnas: 'banco', 'monto', 'fecha', 'descripcion' (opcional)
-# 'banco' debe ser una cadena con el nombre del banco: "Bancolombia", "Nequi", "Nu", "Davivienda", etc.
+EMPLEADOS = {
+    "William": {"numero": "3182309554", "banco": "Nequi", "tipo": "celular"},
+    "Diana": {"numero": "3133761278", "banco": "Nequi", "tipo": "celular"},
+    "Mabel": {"numero": "3105477761", "banco": "Nequi", "tipo": "celular"},
+    "Hugo": {
+        "numero": "16132028650",  # Nota: tiene 11 dígitos, cuenta Bancolombia
+        "banco": "Bancolombia",
+        "tipo": "cuenta",
+    },
+    "Natalia": {
+        "numero": "10065329940",  # 11 dígitos
+        "banco": "Bancolombia",
+        "tipo": "cuenta",
+    },
+}
 
 
 # ------------------------------------------------------------
-# 2. FUNCIÓN PARA GENERAR INFORME DE BANCOS
+# 2. FUNCIÓN PARA IDENTIFICAR EL EMPLEADO A PARTIR DE LA DESCRIPCIÓN
 # ------------------------------------------------------------
-def generar_informe_bancos(df):
+def identificar_empleado(descripcion, monto, banco_origen=None):
     """
-    Genera un informe detallado de transacciones por banco.
-    Retorna un DataFrame con el resumen y guarda gráficos.
+    Busca en la descripción si aparece algún número de empleado (celular o cuenta).
+    Retorna el nombre del empleado si encuentra coincidencia, o None si no.
+    Además, se fija en el banco_origen para filtrar (opcional).
     """
-    # Copia para no modificar el original
-    data = df.copy()
+    if not isinstance(descripcion, str) or pd.isna(descripcion):
+        return None
 
-    # Asegurar que la columna banco esté en mayúscula primera letra para uniformidad
-    data["banco"] = data["banco"].str.title()
+    desc_lower = descripcion.lower()
 
-    # Identificar ingresos y egresos
-    data["tipo"] = data["monto"].apply(lambda x: "Ingreso" if x > 0 else "Egreso")
-    data["monto_abs"] = data["monto"].abs()
+    # Recorremos todos los empleados
+    for nombre, datos in EMPLEADOS.items():
+        numero = datos["numero"]
+        # Opcional: filtrar por banco_origen si se proporciona
+        if banco_origen and datos["banco"].lower() != banco_origen.lower():
+            continue  # Si el banco no coincide, saltamos
 
-    # ------------------------------------------------------------
-    # 2.1. Resumen general por banco (todas las transacciones)
-    # ------------------------------------------------------------
-    resumen_general = (
-        data.groupby("banco")
+        # Buscar el número en la descripción (puede estar con o sin espacios, guiones, etc.)
+        # Normalizamos: eliminamos espacios, guiones, puntos del número en la descripción
+        desc_limpia = re.sub(r"[\s\-\.]", "", desc_lower)
+        numero_limpio = numero  # ya está sin espacios
+
+        # Búsqueda directa
+        if numero_limpio in desc_limpia:
+            return nombre
+
+        # También buscamos el nombre del empleado (por si acaso)
+        if nombre.lower() in desc_lower:
+            return nombre
+
+    return None
+
+
+# ------------------------------------------------------------
+# 3. APLICACIÓN AL DATAFRAME
+# ------------------------------------------------------------
+# Suponemos que df tiene columnas: 'descripcion', 'monto', 'fecha' y 'banco_origen' (opcional)
+# Si no tienes 'banco_origen', puedes omitirlo en la llamada.
+
+# Aplicar identificación
+df["empleado"] = df.apply(
+    lambda row: identificar_empleado(
+        row["descripcion"],
+        row["monto"],
+        row.get("banco_origen", None),  # Si no existe, pasa None
+    ),
+    axis=1,
+)
+
+# Marcar como nómina solo si el monto es negativo (egreso) y se encontró empleado
+df["categoria"] = df.apply(
+    lambda row: (
+        "Nómina"
+        if (row["empleado"] is not None and row["monto"] < 0)
+        else row.get("categoria", "Otros")
+    ),
+    axis=1,
+)
+
+# ------------------------------------------------------------
+# 4. GENERAR INFORME DE NÓMINA
+# ------------------------------------------------------------
+# Filtrar solo transacciones de nómina (egresos)
+nomina_df = df[(df["categoria"] == "Nómina") & (df["monto"] < 0)].copy()
+nomina_df["monto_abs"] = nomina_df["monto"].abs()  # Convertir a positivo para análisis
+
+if not nomina_df.empty:
+    # Agrupar por empleado
+    reporte_nomina = (
+        nomina_df.groupby("empleado")
         .agg(
-            total_transacciones=("monto", "count"),
-            total_monto=("monto_abs", "sum"),
-            monto_promedio=("monto_abs", "mean"),
+            total_pagado=("monto_abs", "sum"),
+            num_pagos=("monto_abs", "count"),
+            promedio_pago=("monto_abs", "mean"),
+            ultimo_pago=("fecha", "max"),
+            primer_pago=("fecha", "min"),
         )
         .reset_index()
-        .sort_values("total_monto", ascending=False)
+        .sort_values("total_pagado", ascending=False)
     )
 
-    # Calcular participación porcentual
-    total_monto_general = resumen_general["total_monto"].sum()
-    resumen_general["%_participacion_monto"] = (
-        resumen_general["total_monto"] / total_monto_general * 100
-    ).round(2)
-    resumen_general["%_participacion_transacciones"] = (
-        resumen_general["total_transacciones"]
-        / resumen_general["total_transacciones"].sum()
-        * 100
-    ).round(2)
+    print("📋 INFORME DE NÓMINA (Pagos identificados)")
+    print("==========================================")
+    print(reporte_nomina.to_string(index=False))
+
+    # Exportar a Excel
+    with pd.ExcelWriter("reporte_nomina.xlsx") as writer:
+        reporte_nomina.to_excel(writer, sheet_name="Resumen Nómina", index=False)
+        # Detalle de cada pago
+        nomina_df[
+            ["fecha", "descripcion", "monto", "empleado", "banco_origen"]
+        ].to_excel(writer, sheet_name="Detalle Pagos", index=False)
 
     # ------------------------------------------------------------
-    # 2.2. Desglose por tipo (Ingreso/Egreso)
+    # 5. OPCIONAL: CONCILIACIÓN CON SALARIOS ESPERADOS (si tienes un archivo)
+    # Si tienes un archivo con los salarios base (ej. Excel con columnas: empleado, salario_mensual),
+    # puedes comparar.
     # ------------------------------------------------------------
-    resumen_por_tipo = (
-        data.groupby(["banco", "tipo"])
-        .agg(total_monto=("monto_abs", "sum"), transacciones=("monto", "count"))
-        .reset_index()
-    )
+    # Ejemplo de carga de salarios esperados (descomentar si existe)
+    # salarios_esperados = pd.read_excel('salarios_esperados.xlsx')
+    # comparativa = reporte_nomina.merge(salarios_esperados, on='empleado', how='outer')
+    # comparativa['diferencia'] = comparativa['total_pagado'] - comparativa['salario_mensual']
+    # print("\n🔍 Comparativa con salarios esperados:")
+    # print(comparativa[['empleado', 'total_pagado', 'salario_mensual', 'diferencia']])
 
-    # Pivot para tener una tabla ancha (más fácil de leer)
-    pivot_monto = resumen_por_tipo.pivot(
-        index="banco", columns="tipo", values="total_monto"
-    ).fillna(0)
-    pivot_transacciones = resumen_por_tipo.pivot(
-        index="banco", columns="tipo", values="transacciones"
-    ).fillna(0)
-
-    # Calcular ratio ingreso/egreso por banco (monto)
-    pivot_monto["ratio_ingreso_egreso"] = pivot_monto["Ingreso"] / pivot_monto[
-        "Egreso"
-    ].replace(
-        0, 1
-    )  # evitar división por cero
-
-    # ------------------------------------------------------------
-    # 2.3. Crear gráficos
-    # ------------------------------------------------------------
-    # Configuración de estilo
-    sns.set_style("whitegrid")
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(
-        "📊 Informe de Transacciones por Banco", fontsize=16, fontweight="bold"
-    )
-
-    # Gráfico 1: Distribución de montos por banco (pastel)
-    ax1 = axes[0, 0]
-    colores = sns.color_palette("Set3", len(resumen_general))
-    wedges, texts, autotexts = ax1.pie(
-        resumen_general["total_monto"],
-        labels=resumen_general["banco"],
-        autopct=lambda p: f"{p:.1f}%",
-        startangle=90,
-        colors=colores,
-        explode=[0.02] * len(resumen_general),
-        shadow=True,
-    )
-    ax1.set_title("Distribución de Montos por Banco")
-
-    # Gráfico 2: Número de transacciones por banco (barras)
-    ax2 = axes[0, 1]
-    sns.barplot(
-        data=resumen_general,
-        x="banco",
-        y="total_transacciones",
-        palette="viridis",
-        ax=ax2,
-    )
-    ax2.set_title("Número de Transacciones por Banco")
-    ax2.set_ylabel("Número de transacciones")
-    ax2.set_xlabel("Banco")
-    for p in ax2.patches:
-        ax2.annotate(
-            f"{int(p.get_height())}",
-            (p.get_x() + p.get_width() / 2.0, p.get_height() + 0.5),
-            ha="center",
-            va="bottom",
-            fontsize=10,
-        )
-
-    # Gráfico 3: Monto promedio por banco (barras horizontales)
-    ax3 = axes[1, 0]
-    resumen_general_sorted = resumen_general.sort_values(
-        "monto_promedio", ascending=True
-    )
-    sns.barplot(
-        data=resumen_general_sorted,
-        y="banco",
-        x="monto_promedio",
-        palette="coolwarm",
-        ax=ax3,
-    )
-    ax3.set_title("Monto Promedio por Transacción")
-    ax3.set_xlabel("Monto promedio (COP)")
-    ax3.set_ylabel("Banco")
-    ax3.xaxis.set_major_formatter(FuncFormatter(lambda x, p: f"${x:,.0f}"))
-
-    # Gráfico 4: Ingresos vs Egresos por banco (barras agrupadas)
-    ax4 = axes[1, 1]
-    # Preparar datos para barras agrupadas
-    pivot_monto_plot = pivot_monto[["Ingreso", "Egreso"]].fillna(0)
-    pivot_monto_plot.plot(kind="bar", ax=ax4, color=["green", "red"], alpha=0.7)
-    ax4.set_title("Montos de Ingresos vs Egresos por Banco")
-    ax4.set_ylabel("Monto total (COP)")
-    ax4.set_xlabel("Banco")
-    ax4.legend(title="Tipo")
-    ax4.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f"${x:,.0f}"))
-    ax4.grid(axis="y", linestyle="--", alpha=0.5)
-
-    plt.tight_layout()
-    plt.savefig("informe_bancos.png", dpi=150, bbox_inches="tight")
-    plt.show()
-
-    # ------------------------------------------------------------
-    # 2.4. Exportar a Excel con múltiples hojas
-    # ------------------------------------------------------------
-    with pd.ExcelWriter("informe_bancos.xlsx") as writer:
-        resumen_general.to_excel(writer, sheet_name="Resumen General", index=False)
-        pivot_monto.to_excel(writer, sheet_name="Ingresos vs Egresos (Monto)")
-        pivot_transacciones.to_excel(writer, sheet_name="Ingresos vs Egresos (Nº)")
-        # Hoja adicional con el detalle de cada transacción (opcional)
-        data[["fecha", "banco", "descripcion", "monto", "tipo"]].to_excel(
-            writer, sheet_name="Detalle Transacciones", index=False
-        )
-
-    # ------------------------------------------------------------
-    # 2.5. Imprimir resumen en consola
-    # ------------------------------------------------------------
-    print("🏦 INFORME DE BANCOS DE TRANSACCIÓN")
-    print("===================================")
-    print(resumen_general.to_string(index=False))
-    print("\n📊 Distribución de Ingresos vs Egresos (por monto):")
-    print(
-        pivot_monto[["Ingreso", "Egreso", "ratio_ingreso_egreso"]].round(2).to_string()
-    )
-
-    return resumen_general, pivot_monto
-
+else:
+    print("⚠️ No se encontraron pagos de nómina en el período.")
 
 # ------------------------------------------------------------
-# 3. EJEMPLO DE USO (ASUMIENDO QUE TIENES df CON COLUMNA 'banco')
+# 6. ADICIONAL: VISUALIZAR LAS TRANSACCIONES IDENTIFICADAS
 # ------------------------------------------------------------
-# df = pd.read_csv('tus_extractos.csv')  # <-- descomenta y ajusta
-# resumen, pivot = generar_informe_bancos(df)
-
-
-# ------------------------------------------------------------
-# 4. (OPCIONAL) FUNCIÓN PARA INFERIR BANCO A PARTIR DE DESCRIPCIÓN
-#    Útil si no tienes la columna 'banco' y quieres asignarla automáticamente
-# ------------------------------------------------------------
-def inferir_banco(descripcion):
-    """
-    Infiere el banco a partir de la descripción de la transacción.
-    Retorna el nombre del banco o 'Otro'.
-    """
-    desc_lower = str(descripcion).lower()
-    if "bancolombia" in desc_lower:
-        return "Bancolombia"
-    elif "nequi" in desc_lower:
-        return "Nequi"
-    elif "nu" in desc_lower or "nubank" in desc_lower:
-        return "Nu"
-    elif "davivienda" in desc_lower:
-        return "Davivienda"
-    else:
-        return "Otro"
-
-
-# Ejemplo de cómo asignar 'banco' si no existe
-# if 'banco' not in df.columns:
-#     df['banco'] = df['descripcion'].apply(inferir_banco)
-#     print("✅ Columna 'banco' inferida automáticamente.")
+# Mostrar las primeras filas identificadas
+print("\n📌 Ejemplos de pagos de nómina identificados:")
+print(
+    nomina_df[["fecha", "descripcion", "monto", "empleado"]]
+    .head(10)
+    .to_string(index=False)
+)
