@@ -1,192 +1,387 @@
-import smtplib
+import pandas as pd
 import os
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime
-from twilio.rest import Client
+import hashlib
 
 
 # ------------------------------------------------------------
-# 1. CONFIGURACIÓN DE NOTIFICACIONES (con los datos proporcionados)
+# CONFIGURACIÓN DE EXCEPCIONES
 # ------------------------------------------------------------
-class ConfiguracionNotificaciones:
-    # --- EMAIL (Gmail) ---
-    email_remitente: str = "samuelhoyos2007@gmail.com"  # Cambia por tu correo Gmail
-    email_password: str = (
-        "wijf ptwd aihv gphn"  # Contraseña de aplicación (16 caracteres)
-    )
-    email_destinatario: str = "henkabio.adm@gmail.com"  # Destinatario fijo
-    smtp_server: str = "smtp.gmail.com"
-    smtp_port: int = 587
-    asunto_email: str = "Informe Código Contable"  # Asunto fijo
-
-    # --- WHATSAPP (Twilio Sandbox) ---
-    twilio_account_sid: str = (
-        "US5bf4e21d162b0f4521a8436ea85bf530"  # User SID (el que compartiste)
-    )
-    twilio_auth_token: str = "07aa11afb99953d2d7f7250fab7790ae"  # Auth Token
-    twilio_whatsapp_number: str = (
-        "whatsapp:+14155238886"  # Número del sandbox de Twilio
-    )
-    # El destinatario debe estar registrado en el sandbox (enviar mensaje de unión)
-    whatsapp_destinatario: str = "whatsapp:+573160470196"  # O +573502110083 (elige uno)
-
-    # --- CONTROL DE ENVÍO ---
-    enviar_email: bool = True
-    enviar_whatsapp: bool = True
+class ConfiguracionExcepciones:
+    # Ruta donde se guardarán los archivos de revisión
+    directorio_revision: str = "./cola_revision/"
+    # Umbral de confianza para clasificación (punto #1)
+    umbral_clasificacion: int = 70
+    # Archivo de configuración para reintentos
+    archivo_reintentos: str = "reintentos_pendientes.xlsx"
 
 
-config_notif = ConfiguracionNotificaciones()
+config_exc = ConfiguracionExcepciones()
 
 
 # ------------------------------------------------------------
-# 2. FUNCIÓN PARA GENERAR DESCRIPCIÓN DE ERRORES (mejorada)
+# 1. DETECCIÓN DE EXCEPCIONES
 # ------------------------------------------------------------
-def generar_descripcion_errores(errores: list, resumen: dict = None) -> str:
+def detectar_excepciones(df: pd.DataFrame, reglas: dict = None) -> pd.DataFrame:
     """
-    Genera un texto estructurado con la descripción de los errores ocurridos
-    y un resumen de la ejecución.
+    Identifica transacciones que requieren revisión humana.
+
+    Criterios de excepción:
+    - Categoría 'Otros' o 'Sin Clasificar' (punto #1)
+    - No conciliadas con factura (punto #8)
+    - Monto atípico (opcional)
+    - Faltan datos críticos (NIT, descripción, etc.)
+
+    Args:
+        df: DataFrame con transacciones (debe tener columnas: 'categoria', 'conciliado', 'monto', etc.)
+        reglas: Diccionario opcional con reglas adicionales.
+
+    Returns:
+        DataFrame con las transacciones que son excepción.
     """
-    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Asegurar que las columnas existan
+    condiciones = []
 
-    if not errores:
-        return f"✅ Proceso completado sin errores.\n📅 Fecha: {ahora}"
-
-    texto = "⚠️ SE DETECTARON ERRORES EN LA AUTOMATIZACIÓN\n"
-    texto += "=" * 50 + "\n"
-    texto += f"📅 Fecha: {ahora}\n"
-
-    if resumen:
-        texto += f"📊 Total transacciones procesadas: {resumen.get('total_movimientos', 'N/A')}\n"
-        texto += f"✅ Conciliaciones exitosas: {resumen.get('conciliaciones_exitosas', 'N/A')}\n"
-        texto += f"❌ Errores encontrados: {len(errores)}\n"
-
-    texto += f"\n❌ DETALLE DE ERRORES:\n"
-    texto += "-" * 40 + "\n"
-
-    for i, error in enumerate(errores, 1):
-        texto += f"\n{i}. {error.get('entidad', 'Desconocida')}\n"
-        texto += f"   Motivo: {error.get('motivo', 'Sin descripción')}\n"
-        if error.get("detalle"):
-            texto += f"   Detalle: {error.get('detalle')}\n"
-
-    return texto
-
-
-# ------------------------------------------------------------
-# 3. ENVÍO DE NOTIFICACIÓN POR EMAIL (Gmail)
-# ------------------------------------------------------------
-def enviar_email(asunto: str, cuerpo: str, config: ConfiguracionNotificaciones) -> bool:
-    """
-    Envía un correo electrónico usando Gmail SMTP.
-    """
-    if not config.enviar_email:
-        return True
-
-    try:
-        # Crear mensaje
-        msg = MIMEMultipart()
-        msg["From"] = config.email_remitente
-        msg["To"] = config.email_destinatario
-        msg["Subject"] = asunto
-
-        # Cuerpo del mensaje (texto plano)
-        msg.attach(MIMEText(cuerpo, "plain"))
-
-        # Conectar al servidor SMTP de Gmail
-        with smtplib.SMTP(config.smtp_server, config.smtp_port) as server:
-            server.starttls()  # Habilitar TLS
-            server.login(config.email_remitente, config.email_password)
-            server.send_message(msg)
-
-        print(f"📧 Email enviado a {config.email_destinatario}")
-        return True
-    except Exception as e:
-        print(f"❌ Error enviando email: {e}")
-        return False
-
-
-# ------------------------------------------------------------
-# 4. ENVÍO DE NOTIFICACIÓN POR WHATSAPP (Twilio Sandbox)
-# ------------------------------------------------------------
-def enviar_whatsapp(mensaje: str, config: ConfiguracionNotificaciones) -> bool:
-    """
-    Envía un mensaje por WhatsApp usando el sandbox de Twilio.
-    """
-    if not config.enviar_whatsapp:
-        return True
-
-    try:
-        client = Client(config.twilio_account_sid, config.twilio_auth_token)
-        message = client.messages.create(
-            body=mensaje[:1600],  # Twilio tiene límite de caracteres
-            from_=config.twilio_whatsapp_number,
-            to=config.whatsapp_destinatario,
+    # 1. Categoría no definida (del punto #1)
+    if "categoria" in df.columns:
+        condiciones.append(
+            df["categoria"].isin(["Otros", "Sin Clasificar", "No Definida"])
         )
-        print(
-            f"💬 WhatsApp enviado a {config.whatsapp_destinatario} (SID: {message.sid})"
+
+    # 2. No conciliadas con factura (del punto #8)
+    if "conciliado" in df.columns:
+        condiciones.append(df["conciliado"] == False)
+
+    # 3. Monto extremo (opcional: fuera de 3 desviaciones estándar)
+    if "monto" in df.columns:
+        mean = df["monto"].mean()
+        std = df["monto"].std()
+        if std > 0:
+            condiciones.append(
+                (df["monto"] > mean + 3 * std) | (df["monto"] < mean - 3 * std)
+            )
+
+    # 4. Faltan datos críticos
+    if "nit_cliente" in df.columns:
+        condiciones.append(df["nit_cliente"].isna())
+    if "descripcion" in df.columns:
+        condiciones.append(df["descripcion"].str.len() < 5)
+
+    # Combinar condiciones con OR (cualquier condición se considera excepción)
+    if condiciones:
+        mascara_excepcion = pd.concat(condiciones, axis=1).any(axis=1)
+    else:
+        mascara_excepcion = pd.Series([False] * len(df))
+
+    return df[mascara_excepcion].copy()
+
+
+# ------------------------------------------------------------
+# 2. GENERAR ARCHIVO PARA REVISIÓN HUMANA (EXCEL)
+# ------------------------------------------------------------
+def generar_cola_revision(
+    df_excepciones: pd.DataFrame, nombre_archivo: str = None, directorio: str = None
+) -> str:
+    """
+    Exporta las excepciones a un archivo Excel editable.
+    Incluye columnas adicionales para que el humano pueda corregir:
+    - categoria_corregida
+    - nit_corregido
+    - conciliado_manual
+    - observaciones
+
+    Returns:
+        Ruta del archivo generado.
+    """
+    if directorio is None:
+        directorio = config_exc.directorio_revision
+
+    # Crear directorio si no existe
+    os.makedirs(directorio, exist_ok=True)
+
+    if nombre_archivo is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        nombre_archivo = f"cola_revision_{timestamp}.xlsx"
+
+    ruta_completa = os.path.join(directorio, nombre_archivo)
+
+    # Copiar DataFrame y agregar columnas para corrección manual
+    df_revision = df_excepciones.copy()
+
+    # Añadir columnas vacías para que el humano llene
+    df_revision["categoria_corregida"] = ""
+    df_revision["nit_corregido"] = ""
+    df_revision["conciliado_manual"] = False
+    df_revision["observaciones"] = ""
+    df_revision["revisado"] = False
+
+    # Añadir un hash de la fila para trazabilidad
+    df_revision["hash_fila"] = df_revision.apply(
+        lambda row: hashlib.md5(str(row.to_dict()).encode()).hexdigest()[:8], axis=1
+    )
+
+    # Guardar a Excel
+    with pd.ExcelWriter(ruta_completa, engine="openpyxl") as writer:
+        df_revision.to_excel(writer, sheet_name="Excepciones", index=False)
+
+        # Añadir hoja de instrucciones
+        instrucciones = pd.DataFrame(
+            {
+                "Instrucciones": [
+                    "1. Revisa cada transacción marcada como excepción.",
+                    '2. Corrige la categoría en la columna "categoria_corregida".',
+                    '3. Si conoces el NIT, escríbelo en "nit_corregido".',
+                    '4. Marca "conciliado_manual" como TRUE si ya fue conciliado.',
+                    "5. Añade observaciones si es necesario.",
+                    '6. Marca "revisado" como TRUE cuando termines.',
+                    "7. Guarda el archivo y ejecuta el script de reintento.",
+                ]
+            }
         )
-        return True
-    except Exception as e:
-        print(f"❌ Error enviando WhatsApp: {e}")
-        return False
+        instrucciones.to_excel(writer, sheet_name="Instrucciones", index=False)
+
+    print(f"📋 Cola de revisión generada en: {ruta_completa}")
+    print(f"   Transacciones pendientes: {len(df_revision)}")
+    return ruta_completa
 
 
 # ------------------------------------------------------------
-# 5. FUNCIÓN PRINCIPAL DE NOTIFICACIÓN (UNIFICADA)
+# 3. FUNCIÓN DE REINTENTO (PROCESAR CORRECCIONES HUMANAS)
 # ------------------------------------------------------------
-def enviar_notificacion(
-    errores: list, resumen: dict = None, config: ConfiguracionNotificaciones = None
+def procesar_reintentos(
+    archivo_revision: str, df_original: pd.DataFrame, funcion_procesamiento: callable
 ) -> dict:
     """
-    Envía notificaciones por email (Gmail) y WhatsApp (Twilio) con el reporte de ejecución.
-    Retorna un diccionario con el estado de cada envío.
+    Lee el archivo Excel corregido por el humano y procesa las transacciones.
+
+    Args:
+        archivo_revision: Ruta del Excel con correcciones.
+        df_original: DataFrame original con todas las transacciones.
+        funcion_procesamiento: Función que recibe una fila corregida y la procesa
+                               (ej. crea comprobante en Siigo, actualiza factura, etc.)
+
+    Returns:
+        Diccionario con estadísticas del reintento.
     """
-    if config is None:
-        config = config_notif
+    if not os.path.exists(archivo_revision):
+        return {"error": f"Archivo no encontrado: {archivo_revision}"}
 
-    # Generar el cuerpo del mensaje
-    cuerpo = generar_descripcion_errores(errores, resumen)
+    # Cargar el archivo corregido
+    df_revision = pd.read_excel(archivo_revision, sheet_name="Excepciones")
 
-    # Añadir cabecera con información del proceso
-    cuerpo_completo = "📋 REPORTE DE AUTOMATIZACIÓN CONTABLE\n"
-    cuerpo_completo += "=" * 40 + "\n"
-    cuerpo_completo += cuerpo
+    # Filtrar solo las filas que fueron revisadas
+    df_revisadas = df_revision[df_revision["revisado"] == True].copy()
 
-    resultados = {"email": False, "whatsapp": False}
+    if df_revisadas.empty:
+        return {
+            "total_revisadas": 0,
+            "procesadas": 0,
+            "errores": 0,
+            "mensaje": "No hay transacciones marcadas como revisadas.",
+        }
 
-    # Enviar email (con asunto fijo)
-    if config.enviar_email:
-        resultados["email"] = enviar_email(config.asunto_email, cuerpo_completo, config)
+    resultados = {
+        "total_revisadas": len(df_revisadas),
+        "procesadas": 0,
+        "errores": 0,
+        "detalle_errores": [],
+    }
 
-    # Enviar WhatsApp (con el mismo contenido, pero acortado si es necesario)
-    if config.enviar_whatsapp:
-        # Truncar a 1600 caracteres para WhatsApp
-        mensaje_whatsapp = cuerpo_completo[:1600]
-        resultados["whatsapp"] = enviar_whatsapp(mensaje_whatsapp, config)
+    # Procesar cada fila corregida
+    for idx, row in df_revisadas.iterrows():
+        try:
+            # Buscar la transacción original (usando hash o algún identificador)
+            # En este ejemplo, usamos el hash_fila
+            hash_fila = row.get("hash_fila")
+            if hash_fila:
+                # Buscar en el DataFrame original (podrías tenerlo guardado)
+                # Aquí simulamos que funcion_procesamiento recibe la fila corregida
+                resultado = funcion_procesamiento(row)
+                if resultado.get("exito", False):
+                    resultados["procesadas"] += 1
+                else:
+                    resultados["errores"] += 1
+                    resultados["detalle_errores"].append(
+                        {
+                            "fila": idx,
+                            "error": resultado.get("mensaje", "Error desconocido"),
+                        }
+                    )
+            else:
+                # Si no hay hash, intentar por otros campos (fecha, monto, descripción)
+                # Esto es menos robusto pero puede funcionar
+                # ...
+                pass
+        except Exception as e:
+            resultados["errores"] += 1
+            resultados["detalle_errores"].append({"fila": idx, "error": str(e)})
+
+    # Generar reporte del reintento
+    generar_reporte_reintento(resultados, archivo_revision)
 
     return resultados
 
 
 # ------------------------------------------------------------
-# 6. EJEMPLO DE USO (INTEGRADO CON TU CÓDIGO EXISTENTE)
+# 4. GENERAR REPORTE DEL REINTENTO
+# ------------------------------------------------------------
+def generar_reporte_reintento(resultados: dict, archivo_original: str):
+    """
+    Genera un pequeño reporte en TXT con los resultados del reintento.
+    """
+    nombre_reporte = f"reporte_reintento_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    with open(nombre_reporte, "w") as f:
+        f.write("=== REPORTE DE REINTENTO ===\n")
+        f.write(f"Archivo revisado: {archivo_original}\n")
+        f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(
+            f"Total transacciones revisadas: {resultados.get('total_revisadas', 0)}\n"
+        )
+        f.write(f"Procesadas exitosamente: {resultados.get('procesadas', 0)}\n")
+        f.write(f"Errores: {resultados.get('errores', 0)}\n")
+
+        if resultados.get("detalle_errores"):
+            f.write("\n--- DETALLE DE ERRORES ---\n")
+            for err in resultados["detalle_errores"]:
+                f.write(
+                    f"Fila {err.get('fila', 'N/A')}: {err.get('error', 'Sin detalle')}\n"
+                )
+
+    print(f"📄 Reporte de reintento generado: {nombre_reporte}")
+
+
+# ------------------------------------------------------------
+# 5. FUNCIÓN DE PROCESAMIENTO DE UNA FILA CORREGIDA (EJEMPLO)
+# ------------------------------------------------------------
+def procesar_fila_corregida(fila_corregida: pd.Series, config: dict) -> dict:
+    """
+    Esta función recibe una fila corregida y la procesa.
+    Debes adaptarla a tu lógica específica (crear comprobante, actualizar factura, etc.)
+    """
+    try:
+        # Extraer datos corregidos
+        categoria = fila_corregida.get("categoria_corregida", "")
+        nit = fila_corregida.get("nit_corregido", "")
+        conciliado = fila_corregida.get("conciliado_manual", False)
+
+        # Aquí iría la lógica de:
+        # - Actualizar la categoría en la base de datos local
+        # - Si tiene NIT, buscar/crear el tercero en Siigo
+        # - Si está conciliado manualmente, marcar la factura como pagada
+        # - Reintentar la creación del comprobante en Siigo
+
+        # Simulación:
+        print(f"🔄 Procesando fila: {fila_corregida.get('hash_fila')}")
+        print(f"   Categoría corregida: {categoria}")
+        print(f"   NIT corregido: {nit}")
+
+        # Ejemplo: Si la categoría ahora es válida, la procesamos
+        if categoria and categoria != "Otros":
+            # Llamar a la función de creación de comprobante (punto #3)
+            # resultado = crear_comprobante_siigo(fila_corregida)
+            return {"exito": True, "mensaje": "Procesado correctamente"}
+        else:
+            return {"exito": False, "mensaje": "Categoría no válida"}
+
+    except Exception as e:
+        return {"exito": False, "mensaje": str(e)}
+
+
+# ------------------------------------------------------------
+# 6. INTEGRACIÓN CON EL FLUJO PRINCIPAL (PUNTO #8 Y #10)
+# ------------------------------------------------------------
+def integrar_cola_revision(
+    df: pd.DataFrame,
+    errores_globales: list,
+    resumen_global: dict,
+    config_exc: ConfiguracionExcepciones = None,
+) -> dict:
+    """
+    Función de integración que une el punto #11 con los puntos #8 y #10.
+
+    Args:
+        df: DataFrame con todas las transacciones procesadas.
+        errores_globales: Lista de errores acumulados (del punto #10).
+        resumen_global: Diccionario con el resumen del proceso.
+        config_exc: Configuración de excepciones.
+
+    Returns:
+        Diccionario con el estado de la cola de revisión.
+    """
+    if config_exc is None:
+        config_exc = ConfiguracionExcepciones()
+
+    # 1. Detectar excepciones en el DataFrame (integración con #1 y #8)
+    df_excepciones = detectar_excepciones(df)
+
+    if df_excepciones.empty:
+        print("✅ No se detectaron excepciones. Todo procesado correctamente.")
+        return {"tiene_excepciones": False, "cantidad": 0, "archivo": None}
+
+    # 2. Si hay excepciones, generar archivo de revisión
+    print(
+        f"⚠️ Se detectaron {len(df_excepciones)} excepciones. Generando cola de revisión..."
+    )
+    archivo_revision = generar_cola_revision(df_excepciones)
+
+    # 3. Agregar a la lista de errores (para notificación #10)
+    errores_globales.append(
+        {
+            "entidad": "Sistema",
+            "motivo": f"Se generaron {len(df_excepciones)} excepciones para revisión humana",
+            "detalle": f"Revisar archivo: {archivo_revision}",
+        }
+    )
+
+    # 4. Actualizar el resumen global (para #10)
+    resumen_global["excepciones_pendientes"] = len(df_excepciones)
+    resumen_global["archivo_revision"] = archivo_revision
+
+    # 5. Retornar información de la cola
+    return {
+        "tiene_excepciones": True,
+        "cantidad": len(df_excepciones),
+        "archivo": archivo_revision,
+        "mensaje": f"Se generó cola de revisión con {len(df_excepciones)} transacciones",
+    }
+
+
+# ------------------------------------------------------------
+# EJEMPLO DE USO INTEGRADO
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    # Simulación de errores y resumen
-    errores_ejemplo = [
+    # Simulación de DataFrame con transacciones (de los puntos #1 y #8)
+    df_ejemplo = pd.DataFrame(
         {
-            "entidad": "Bancolombia",
-            "motivo": "Timeout en la conexión",
-            "detalle": "La API no respondió en 120s",
-        },
-        {
-            "entidad": "Nu",
-            "motivo": "Archivo PDF no encontrado",
-            "detalle": "No existe extracto_Nu_2026-07.pdf",
-        },
-    ]
-    resumen_ejemplo = {"total_movimientos": 45, "conciliaciones_exitosas": 43}
+            "fecha": ["2026-07-10", "2026-07-12", "2026-07-15"],
+            "descripcion": [
+                "Pago a Protoquímica",
+                "Ingreso Frutesa",
+                "Compra desconocida",
+            ],
+            "monto": [-1500000, 2500000, -800000],
+            "categoria": ["Inorgánicos", "Ventas", "Otros"],  # <-- Una excepción
+            "conciliado": [True, True, False],  # <-- Otra excepción
+            "nit_cliente": ["800123456-0", "900987654-1", None],  # <-- Otra excepción
+        }
+    )
 
-    # Enviar notificaciones
-    estado = enviar_notificacion(errores_ejemplo, resumen_ejemplo)
-    print(f"\n📬 Estado de envíos: {estado}")
+    # Inicializar listas globales (integración con #10)
+    errores_globales = []
+    resumen_global = {"total_movimientos": len(df_ejemplo)}
+
+    # Ejecutar integración del punto #11
+    resultado_cola = integrar_cola_revision(
+        df_ejemplo, errores_globales, resumen_global
+    )
+
+    print("\n📊 Resultado de integración:")
+    print(resultado_cola)
+
+    # Verificar que los errores se hayan añadido (para #10)
+    print("\n📋 Errores globales acumulados:")
+    for err in errores_globales:
+        print(f"  - {err.get('entidad')}: {err.get('motivo')}")
+
+    print("\n📊 Resumen global actualizado:")
+    print(resumen_global)
