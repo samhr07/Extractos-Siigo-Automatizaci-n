@@ -1,366 +1,345 @@
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import pandas as pd
-from datetime import datetime
+import os
+import time
 import json
+from datetime import datetime
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+# ============================================================
+# 1. CONFIGURACIÓN DE CREDENCIALES (COMPLETAR AQUÍ)
+# ============================================================
+
+# --- BANCOLOMBIA ---
+BANCOLOMBIA_USUARIO = ""  # <-- Coloca tu usuario de la Sucursal Virtual Personas
+BANCOLOMBIA_CLAVE = ""  # <-- Coloca tu contraseña de la Sucursal Virtual Personas
+BANCOLOMBIA_NUMERO_CUENTA = ""  # <-- Número de cuenta (opcional, para filtrar)
+
+# --- NU (NUBANK) ---
+NU_CORREO = ""  # <-- Correo registrado en Nu
+NU_CLAVE = ""  # <-- Clave de acceso a la app/web de Nu
+NU_NUMERO_TARJETA = ""  # <-- Número de tarjeta o cuenta (si aplica)
+
+# --- CONFIGURACIÓN GENERAL ---
+CARPETA_DESCARGA = "./extractos_descargados"  # Carpeta donde se guardarán los PDFs
+HEADLESS = False  # True = sin ventana visible (para servidores), False = visible (para depuración)
+TIMEOUT = 60000  # Tiempo de espera máximo en milisegundos (60 segundos)
+
+# Crear carpeta de descargas si no existe
+os.makedirs(CARPETA_DESCARGA, exist_ok=True)
+
+# ============================================================
+# 2. FUNCIÓN PARA DESCARGAR EXTRACTO DE BANCOLOMBIA
+# ============================================================
 
 
-# ------------------------------------------------------------
-# 1. FUNCIÓN PRINCIPAL: GENERAR REPORTE HTML COMPLETO
-# ------------------------------------------------------------
-def generar_reporte_html(
-    movimientos_df: pd.DataFrame,
-    proveedores_report: pd.DataFrame,
-    banco_report: pd.DataFrame,
-    nomina_report: pd.DataFrame = None,
-    conciliacion_df: pd.DataFrame = None,
-    errores: list = None,
-    resumen: dict = None,
-    nombre_archivo: str = "reporte_ejecutivo.html",
-):
+def descargar_extracto_bancolombia(mes: int, año: int, formato: str = "pdf"):
     """
-    Genera un informe ejecutivo en HTML con gráficas, tablas y logs de errores.
+    Descarga el extracto de Bancolombia para el mes y año especificados.
+
+    Args:
+        mes (int): Número del mes (1-12)
+        año (int): Año (ej. 2026)
+        formato (str): 'pdf' o 'excel' (si está disponible)
+
+    Returns:
+        str: Ruta del archivo descargado, o None si falló.
     """
-    if errores is None:
-        errores = []
-    if resumen is None:
-        resumen = {}
+    print(f"[*] Iniciando descarga de extracto Bancolombia - {mes:02d}/{año}")
 
-    # --- Preparar datos para gráficas ---
+    with sync_playwright() as p:
+        # Lanzar navegador (Chromium)
+        browser = p.chromium.launch(headless=HEADLESS, args=["--start-maximized"])
+        context = browser.new_context(
+            accept_downloads=True, viewport={"width": 1280, "height": 720}
+        )
+        page = context.new_page()
 
-    # 1. Gráfica de gastos por categoría (usando columna 'categoria' del punto #1)
-    gastos_df = movimientos_df[movimientos_df["monto"] < 0].copy()
-    gastos_df["monto_abs"] = gastos_df["monto"].abs()
-    gastos_categoria = gastos_df.groupby("categoria")["monto_abs"].sum().reset_index()
-    gastos_categoria = gastos_categoria.sort_values("monto_abs", ascending=False)
+        try:
+            # --- PASO 1: Ir a la Sucursal Virtual Personas ---
+            page.goto("https://www.bancolombia.com/personas", timeout=TIMEOUT)
+            page.wait_for_load_state("networkidle")
 
-    fig_categoria = px.pie(
-        gastos_categoria,
-        values="monto_abs",
-        names="categoria",
-        title="Distribución de Gastos por Categoría",
-        color_discrete_sequence=px.colors.qualitative.Set3,
-        hole=0.3,
+            # --- PASO 2: Hacer clic en "Iniciar sesión" ---
+            # (El selector puede cambiar, ajustar según sea necesario)
+            page.click("text=Iniciar sesión")
+            page.wait_for_load_state("networkidle")
+
+            # --- PASO 3: Ingresar usuario y clave ---
+            # Esperar a que cargue el formulario de login
+            page.wait_for_selector("#usuario", timeout=TIMEOUT)
+            page.fill("#usuario", BANCOLOMBIA_USUARIO)
+            page.fill("#password", BANCOLOMBIA_CLAVE)
+
+            # --- PASO 4: Enviar formulario ---
+            page.click("#login-button")
+            page.wait_for_load_state("networkidle")
+
+            # --- PASO 5: Navegar a la sección de extractos ---
+            # Puede variar según la interfaz; estos son selectores típicos
+            # Intentar con diferentes opciones
+            try:
+                page.click("text=Extractos")
+            except:
+                try:
+                    page.click("text=Documentos")
+                    page.click("text=Extractos")
+                except:
+                    page.goto("https://www.bancolombia.com/personas/extractos")
+
+            page.wait_for_load_state("networkidle")
+
+            # --- PASO 6: Seleccionar mes y año ---
+            # Seleccionar el mes
+            page.select_option("#mes", str(mes))
+            # Seleccionar el año
+            page.select_option("#anio", str(año))
+
+            # Si hay que seleccionar cuenta específica
+            if BANCOLOMBIA_NUMERO_CUENTA:
+                try:
+                    page.select_option("#cuenta", BANCOLOMBIA_NUMERO_CUENTA)
+                except:
+                    pass  # Si no se requiere, continuar
+
+            # --- PASO 7: Descargar el extracto ---
+            # Esperar a que el botón de descarga esté disponible
+            page.wait_for_selector("#descargar", timeout=TIMEOUT)
+
+            # Configurar la descarga
+            with page.expect_download() as download_info:
+                page.click("#descargar")
+
+            download = download_info.value
+            # Guardar el archivo en la carpeta destino
+            extension = "pdf" if formato == "pdf" else "xlsx"
+            nombre_archivo = f"Bancolombia_{año}_{mes:02d}.{extension}"
+            ruta_destino = os.path.join(CARPETA_DESCARGA, nombre_archivo)
+            download.save_as(ruta_destino)
+
+            print(f"[+] Extracto de Bancolombia descargado: {ruta_destino}")
+            browser.close()
+            return ruta_destino
+
+        except PlaywrightTimeoutError as e:
+            print(f"[-] Error de tiempo de espera en Bancolombia: {e}")
+            browser.close()
+            return None
+        except Exception as e:
+            print(f"[-] Error inesperado en Bancolombia: {e}")
+            browser.close()
+            return None
+
+
+# ============================================================
+# 3. FUNCIÓN PARA DESCARGAR EXTRACTO DE NU (NUBANK)
+# ============================================================
+
+
+def descargar_extracto_nu(mes: int, año: int):
+    """
+    Descarga el extracto de Nu para el mes y año especificados.
+
+    NOTA: Nu NO tiene una API pública para descarga automatizada de extractos.
+    Esta función intenta acceder a la versión web de Nu y descargar el PDF.
+    Si falla, se recomienda usar la exportación manual desde la app.
+
+    Args:
+        mes (int): Número del mes (1-12)
+        año (int): Año (ej. 2026)
+
+    Returns:
+        str: Ruta del archivo descargado, o None si falló.
+    """
+    print(f"[*] Iniciando descarga de extracto Nu - {mes:02d}/{año}")
+    print(
+        "[!] Advertencia: Nu no tiene API pública. La descarga automatizada puede fallar."
     )
-    fig_categoria.update_traces(textposition="inside", textinfo="percent+label")
 
-    # 2. Gráfica de proveedores (top 10)
-    top_proveedores = proveedores_report.head(10)
-    fig_proveedores = px.bar(
-        top_proveedores,
-        x="proveedor",
-        y="total_comprado",
-        title="Top 10 Proveedores por Monto",
-        labels={"total_comprado": "Total Comprado ($)", "proveedor": "Proveedor"},
-        color="total_comprado",
-        color_continuous_scale="Blues",
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS, args=["--start-maximized"])
+        context = browser.new_context(
+            accept_downloads=True, viewport={"width": 1280, "height": 720}
+        )
+        page = context.new_page()
+
+        try:
+            # --- PASO 1: Ir al portal web de Nu ---
+            page.goto("https://www.nu.com.co/", timeout=TIMEOUT)
+            page.wait_for_load_state("networkidle")
+
+            # --- PASO 2: Buscar el enlace de inicio de sesión ---
+            # Nu redirige a la app o a la web según el dispositivo
+            # Intentar encontrar el botón de "Ingresar"
+            try:
+                page.click("text=Ingresar")
+            except:
+                try:
+                    page.click("text=Iniciar sesión")
+                except:
+                    # Si no se encuentra, intentar ir directamente a la URL de login
+                    page.goto("https://www.nu.com.co/login")
+
+            page.wait_for_load_state("networkidle")
+
+            # --- PASO 3: Ingresar correo y clave ---
+            page.wait_for_selector("input[type='email']", timeout=TIMEOUT)
+            page.fill("input[type='email']", NU_CORREO)
+            page.fill("input[type='password']", NU_CLAVE)
+
+            # --- PASO 4: Enviar formulario ---
+            page.click("button[type='submit']")
+            page.wait_for_load_state("networkidle")
+
+            # --- PASO 5: Navegar a extractos ---
+            # La interfaz de Nu cambia frecuentemente. Estos son intentos genéricos.
+            try:
+                page.click("text=Extractos")
+            except:
+                try:
+                    page.click("text=Movimientos")
+                except:
+                    page.goto("https://www.nu.com.co/extractos")
+
+            page.wait_for_load_state("networkidle")
+
+            # --- PASO 6: Seleccionar período ---
+            # Nu suele tener un selector de mes/año
+            try:
+                page.select_option("#mes", str(mes))
+                page.select_option("#anio", str(año))
+            except:
+                # Si no hay selectores, buscar botones de navegación
+                pass
+
+            # --- PASO 7: Descargar PDF ---
+            # Buscar botón de descarga
+            try:
+                with page.expect_download() as download_info:
+                    page.click("text=Descargar PDF")
+                download = download_info.value
+                nombre_archivo = f"Nu_{año}_{mes:02d}.pdf"
+                ruta_destino = os.path.join(CARPETA_DESCARGA, nombre_archivo)
+                download.save_as(ruta_destino)
+                print(f"[+] Extracto de Nu descargado: {ruta_destino}")
+                browser.close()
+                return ruta_destino
+            except:
+                print("[-] No se encontró el botón de descarga PDF.")
+                print(
+                    "[!] Sugerencia: Exporta el extracto manualmente desde la app Nu."
+                )
+                browser.close()
+                return None
+
+        except PlaywrightTimeoutError as e:
+            print(f"[-] Error de tiempo de espera en Nu: {e}")
+            browser.close()
+            return None
+        except Exception as e:
+            print(f"[-] Error inesperado en Nu: {e}")
+            browser.close()
+            return None
+
+
+# ============================================================
+# 4. FUNCIÓN PARA DESCARGAR EXTRACTO DE NEQUI (OPCIONAL)
+# ============================================================
+
+
+def descargar_extracto_nequi(mes: int, año: int):
+    """
+    Descarga el extracto de Nequi para el mes y año especificados.
+
+    Nequi tiene una API B2B (Conecta Nequi) pero requiere credenciales corporativas.
+    Esta función intenta usar la versión web.
+
+    Args:
+        mes (int): Número del mes (1-12)
+        año (int): Año (ej. 2026)
+
+    Returns:
+        str: Ruta del archivo descargado, o None si falló.
+    """
+    print(f"[*] Iniciando descarga de extracto Nequi - {mes:02d}/{año}")
+    print(
+        "[!] Advertencia: Nequi no tiene API pública para consumidores. La descarga automatizada puede fallar."
     )
-    fig_proveedores.update_layout(xaxis_tickangle=-45)
 
-    # 3. Gráfica de bancos
-    fig_bancos = px.pie(
-        banco_report,
-        values="total_monto",
-        names="banco_origen",
-        title="Distribución de Movimientos por Banco",
-        color_discrete_sequence=px.colors.qualitative.Pastel,
-    )
-    fig_bancos.update_traces(textposition="inside", textinfo="percent+label")
+    # Nequi no tiene una interfaz web completa para consumidores (solo app móvil).
+    # Esta función es un placeholder. Se recomienda usar la exportación manual
+    # o el portal Conecta Nequi si se tienen credenciales B2B.
 
-    # 4. Gráfica de tendencia histórica (si existe columna 'mes' o agrupamos por fecha)
-    if "fecha" in movimientos_df.columns and not movimientos_df.empty:
-        # Agrupar por mes (asumiendo que fecha es datetime)
-        movimientos_df["mes"] = movimientos_df["fecha"].dt.to_period("M").astype(str)
-        tendencia = movimientos_df.groupby("mes")["monto"].sum().reset_index()
-        tendencia = tendencia.sort_values("mes")
+    print("[!] Nequi: La descarga automatizada no está disponible para consumidores.")
+    print("[!] Sugerencia: Usa el portal 'Conecta Nequi' si tienes credenciales B2B,")
+    print("    o descarga manualmente desde la app.")
+    return None
 
-        fig_tendencia = px.line(
-            tendencia,
-            x="mes",
-            y="monto",
-            title="Evolución del Flujo de Caja Mensual",
-            labels={"monto": "Flujo Neto ($)", "mes": "Mes"},
-            markers=True,
-        )
-        fig_tendencia.add_hline(y=0, line_dash="dash", line_color="red")
-    else:
-        # Si no hay datos históricos, crear una gráfica vacía con mensaje
-        fig_tendencia = go.Figure()
-        fig_tendencia.add_annotation(
-            text="No hay datos históricos suficientes para mostrar tendencia",
-            x=0.5,
-            y=0.5,
-            showarrow=False,
-            font=dict(size=14),
-        )
-        fig_tendencia.update_layout(title="Evolución del Flujo de Caja Mensual")
 
-    # 5. (Opcional) Gráfica de conciliación (si existe)
-    if conciliacion_df is not None and not conciliacion_df.empty:
-        conciliado_count = conciliacion_df["conciliado"].value_counts()
-        fig_conciliacion = px.bar(
-            x=["No Conciliadas", "Conciliadas"],
-            y=[conciliado_count.get(False, 0), conciliado_count.get(True, 0)],
-            title="Estado de Conciliación",
-            labels={"x": "Estado", "y": "Número de Transacciones"},
-            color=["No Conciliadas", "Conciliadas"],
-            color_discrete_sequence=["#EF553B", "#00CC96"],
-        )
-    else:
-        fig_conciliacion = go.Figure()
-        fig_conciliacion.add_annotation(
-            text="No hay datos de conciliación disponibles",
-            x=0.5,
-            y=0.5,
-            showarrow=False,
-            font=dict(size=14),
-        )
-        fig_conciliacion.update_layout(title="Estado de Conciliación")
+# ============================================================
+# 5. FUNCIÓN PRINCIPAL: DESCARGAR TODOS LOS EXTRACTOS
+# ============================================================
 
-    # --- Convertir gráficas a HTML (divs) ---
-    html_categoria = fig_categoria.to_html(full_html=False)
-    html_proveedores = fig_proveedores.to_html(full_html=False)
-    html_bancos = fig_bancos.to_html(full_html=False)
-    html_tendencia = fig_tendencia.to_html(full_html=False)
-    html_conciliacion = fig_conciliacion.to_html(full_html=False)
 
-    # --- Generar tablas en HTML ---
-    def dataframe_to_html(df, max_rows=15):
-        if df is None or df.empty:
-            return "<p><em>No hay datos disponibles</em></p>"
-        # Limitar filas para no hacer el HTML pesado
-        if len(df) > max_rows:
-            df = df.head(max_rows)
-            nota = f"<p><small>Mostrando {max_rows} de {len(df)} registros</small></p>"
+def descargar_extractos(mes: int, año: int, bancos: list = None):
+    """
+    Descarga extractos de los bancos especificados para un mes y año dados.
+
+    Args:
+        mes (int): Número del mes (1-12)
+        año (int): Año (ej. 2026)
+        bancos (list): Lista de bancos a descargar ['Bancolombia', 'Nu', 'Nequi']
+                       Si es None, descarga todos.
+
+    Returns:
+        dict: Diccionario con las rutas de los archivos descargados.
+    """
+    if bancos is None:
+        bancos = ["Bancolombia", "Nu", "Nequi"]
+
+    resultados = {}
+
+    if "Bancolombia" in bancos:
+        ruta = descargar_extracto_bancolombia(mes, año)
+        resultados["Bancolombia"] = ruta
+
+    if "Nu" in bancos:
+        ruta = descargar_extracto_nu(mes, año)
+        resultados["Nu"] = ruta
+
+    if "Nequi" in bancos:
+        ruta = descargar_extracto_nequi(mes, año)
+        resultados["Nequi"] = ruta
+
+    return resultados
+
+
+# ============================================================
+# 6. EJEMPLO DE USO
+# ============================================================
+
+if __name__ == "__main__":
+    # --- CONFIGURAR CREDENCIALES (COMPLETAR ANTES DE EJECUTAR) ---
+    BANCOLOMBIA_USUARIO = "tu_usuario"  # <-- COMPLETAR
+    BANCOLOMBIA_CLAVE = "tu_clave"  # <-- COMPLETAR
+    NU_CORREO = "tu_correo@ejemplo.com"  # <-- COMPLETAR
+    NU_CLAVE = "tu_clave_nu"  # <-- COMPLETAR
+
+    # --- EJECUTAR DESCARGA ---
+    mes_actual = 7
+    año_actual = 2026
+
+    print("=" * 60)
+    print("AUTOMATIZACIÓN DE DESCARGA DE EXTRACTOS BANCARIOS")
+    print("=" * 60)
+
+    # Descargar extractos
+    resultados = descargar_extractos(mes_actual, año_actual, ["Bancolombia", "Nu"])
+
+    # Mostrar resultados
+    print("\n" + "=" * 60)
+    print("RESULTADOS DE LA DESCARGA")
+    print("=" * 60)
+    for banco, ruta in resultados.items():
+        if ruta:
+            print(f"✅ {banco}: {ruta}")
         else:
-            nota = ""
-        return df.to_html(classes="table table-striped", index=False) + nota
-
-    # --- Construir HTML final ---
-    html_template = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Reporte Ejecutivo - Automatización Contable</title>
-        <style>
-            * {{
-                box-sizing: border-box;
-                margin: 0;
-                padding: 0;
-            }}
-            body {{
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: #f4f6f9;
-                padding: 20px;
-                color: #333;
-            }}
-            .container {{
-                max-width: 1400px;
-                margin: 0 auto;
-                background: white;
-                padding: 30px;
-                border-radius: 12px;
-                box-shadow: 0 4px 20px rgba(0,0,0,0.08);
-            }}
-            h1 {{
-                color: #1a3c6e;
-                border-bottom: 3px solid #1a3c6e;
-                padding-bottom: 10px;
-                margin-bottom: 20px;
-                font-weight: 600;
-            }}
-            h2 {{
-                color: #2c3e50;
-                margin-top: 30px;
-                margin-bottom: 15px;
-                padding-bottom: 8px;
-                border-bottom: 2px solid #eaeef2;
-            }}
-            .kpi-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 20px;
-                margin: 20px 0 30px 0;
-            }}
-            .kpi-card {{
-                background: #f8fafc;
-                padding: 20px;
-                border-radius: 10px;
-                text-align: center;
-                border-left: 5px solid #1a3c6e;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-            }}
-            .kpi-card .numero {{
-                font-size: 28px;
-                font-weight: 700;
-                color: #1a3c6e;
-            }}
-            .kpi-card .etiqueta {{
-                font-size: 14px;
-                color: #6c7a8a;
-                margin-top: 5px;
-            }}
-            .chart-grid {{
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 25px;
-                margin: 20px 0;
-            }}
-            .chart-box {{
-                background: #ffffff;
-                padding: 15px;
-                border-radius: 8px;
-                box-shadow: 0 2px 12px rgba(0,0,0,0.06);
-                border: 1px solid #e9edf2;
-            }}
-            .chart-box.full-width {{
-                grid-column: 1 / -1;
-            }}
-            .table-container {{
-                overflow-x: auto;
-                margin: 15px 0;
-                background: #fafbfc;
-                padding: 15px;
-                border-radius: 8px;
-                border: 1px solid #e9edf2;
-            }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-                font-size: 14px;
-            }}
-            table th {{
-                background: #1a3c6e;
-                color: white;
-                padding: 10px 12px;
-                text-align: left;
-            }}
-            table td {{
-                padding: 8px 12px;
-                border-bottom: 1px solid #e9edf2;
-            }}
-            table tr:hover {{
-                background: #f1f4f8;
-            }}
-            .error-log {{
-                background: #fef6f6;
-                border-left: 5px solid #e74c3c;
-                padding: 15px 20px;
-                margin: 20px 0;
-                border-radius: 6px;
-            }}
-            .error-log .error-item {{
-                padding: 8px 0;
-                border-bottom: 1px solid #f0d6d6;
-            }}
-            .error-log .error-item:last-child {{
-                border-bottom: none;
-            }}
-            .error-log strong {{
-                color: #c0392b;
-            }}
-            .footer {{
-                margin-top: 30px;
-                text-align: center;
-                font-size: 12px;
-                color: #95a5a6;
-                border-top: 1px solid #eaeef2;
-                padding-top: 20px;
-            }}
-            @media (max-width: 768px) {{
-                .chart-grid {{
-                    grid-template-columns: 1fr;
-                }}
-                .container {{
-                    padding: 15px;
-                }}
-            }}
-        </style>
-        <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-    </head>
-    <body>
-        <div class="container">
-            <h1>📊 Reporte Ejecutivo - Automatización Contable</h1>
-            <p style="color: #6c7a8a; margin-bottom: 20px;">
-                Generado el {datetime.now().strftime('%d de %B de %Y a las %H:%M')}
-            </p>
-            
-            <!-- KPIs -->
-            <div class="kpi-grid">
-                <div class="kpi-card">
-                    <div class="numero">{resumen.get('total_movimientos', len(movimientos_df))}</div>
-                    <div class="etiqueta">Total Transacciones</div>
-                </div>
-                <div class="kpi-card">
-                    <div class="numero">${resumen.get('total_gastos', gastos_df['monto_abs'].sum() if not gastos_df.empty else 0):,.0f}</div>
-                    <div class="etiqueta">Total Gastos</div>
-                </div>
-                <div class="kpi-card">
-                    <div class="numero">{resumen.get('conciliaciones_exitosas', 0)}</div>
-                    <div class="etiqueta">Transacciones Conciliadas</div>
-                </div>
-                <div class="kpi-card" style="border-left-color: {'#27ae60' if not errores else '#e74c3c'};">
-                    <div class="numero">{len(errores)}</div>
-                    <div class="etiqueta">{'✅ Sin Errores' if not errores else '⚠️ Errores Detectados'}</div>
-                </div>
-            </div>
-            
-            <!-- Gráficas -->
-            <h2>📈 Análisis Gráfico</h2>
-            <div class="chart-grid">
-                <div class="chart-box">{html_categoria}</div>
-                <div class="chart-box">{html_bancos}</div>
-                <div class="chart-box full-width">{html_tendencia}</div>
-                <div class="chart-box">{html_proveedores}</div>
-                <div class="chart-box">{html_conciliacion}</div>
-            </div>
-            
-            <!-- Tablas de Detalle -->
-            <h2>📋 Tablas de Detalle</h2>
-            
-            <h3>🏢 Top Proveedores</h3>
-            <div class="table-container">
-                {dataframe_to_html(proveedores_report, max_rows=15)}
-            </div>
-            
-            <h3>🏦 Distribución por Bancos</h3>
-            <div class="table-container">
-                {dataframe_to_html(banco_report, max_rows=10)}
-            </div>
-            
-            {f'''<h3>👥 Resumen de Nómina</h3>
-            <div class="table-container">
-                {dataframe_to_html(nomina_report, max_rows=10)}
-            </div>''' if nomina_report is not None and not nomina_report.empty else ''}
-            
-            {f'''<h3>🔗 Detalle de Conciliación</h3>
-            <div class="table-container">
-                {dataframe_to_html(conciliacion_df[conciliacion_df['conciliado'] == True].head(20), max_rows=20)}
-            </div>''' if conciliacion_df is not None and not conciliacion_df.empty else ''}
-            
-            <!-- Errores (si los hay) -->
-            {f'''
-            <h2>⚠️ Log de Errores</h2>
-            <div class="error-log">
-                <p><strong>Se detectaron {len(errores)} error(es) durante la ejecución:</strong></p>
-                {"".join([f'<div class="error-item"><strong>{e.get("entidad", "Desconocida")}:</strong> {e.get("motivo", "Sin descripción")} {f"<br><small>Detalle: {e.get('detalle', '')}</small>" if e.get("detalle") else ""}</div>' for e in errores])}
-            </div>
-            ''' if errores else ''}
-            
-            <div class="footer">
-                Reporte generado automáticamente por el Script de Automatización Contable &bull; {datetime.now().year}
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-
-    # Guardar archivo
-    with open(nombre_archivo, "w", encoding="utf-8") as f:
-        f.write(html_template)
-
-    print(f"✅ Reporte HTML generado: {nombre_archivo}")
-    return nombre_archivo
+            print(f"❌ {banco}: Falló la descarga")
