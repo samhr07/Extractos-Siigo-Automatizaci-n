@@ -1,387 +1,366 @@
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import pandas as pd
-import os
 from datetime import datetime
-import hashlib
+import json
 
 
 # ------------------------------------------------------------
-# CONFIGURACIÓN DE EXCEPCIONES
+# 1. FUNCIÓN PRINCIPAL: GENERAR REPORTE HTML COMPLETO
 # ------------------------------------------------------------
-class ConfiguracionExcepciones:
-    # Ruta donde se guardarán los archivos de revisión
-    directorio_revision: str = "./cola_revision/"
-    # Umbral de confianza para clasificación (punto #1)
-    umbral_clasificacion: int = 70
-    # Archivo de configuración para reintentos
-    archivo_reintentos: str = "reintentos_pendientes.xlsx"
-
-
-config_exc = ConfiguracionExcepciones()
-
-
-# ------------------------------------------------------------
-# 1. DETECCIÓN DE EXCEPCIONES
-# ------------------------------------------------------------
-def detectar_excepciones(df: pd.DataFrame, reglas: dict = None) -> pd.DataFrame:
+def generar_reporte_html(
+    movimientos_df: pd.DataFrame,
+    proveedores_report: pd.DataFrame,
+    banco_report: pd.DataFrame,
+    nomina_report: pd.DataFrame = None,
+    conciliacion_df: pd.DataFrame = None,
+    errores: list = None,
+    resumen: dict = None,
+    nombre_archivo: str = "reporte_ejecutivo.html",
+):
     """
-    Identifica transacciones que requieren revisión humana.
-
-    Criterios de excepción:
-    - Categoría 'Otros' o 'Sin Clasificar' (punto #1)
-    - No conciliadas con factura (punto #8)
-    - Monto atípico (opcional)
-    - Faltan datos críticos (NIT, descripción, etc.)
-
-    Args:
-        df: DataFrame con transacciones (debe tener columnas: 'categoria', 'conciliado', 'monto', etc.)
-        reglas: Diccionario opcional con reglas adicionales.
-
-    Returns:
-        DataFrame con las transacciones que son excepción.
+    Genera un informe ejecutivo en HTML con gráficas, tablas y logs de errores.
     """
-    # Asegurar que las columnas existan
-    condiciones = []
+    if errores is None:
+        errores = []
+    if resumen is None:
+        resumen = {}
 
-    # 1. Categoría no definida (del punto #1)
-    if "categoria" in df.columns:
-        condiciones.append(
-            df["categoria"].isin(["Otros", "Sin Clasificar", "No Definida"])
+    # --- Preparar datos para gráficas ---
+
+    # 1. Gráfica de gastos por categoría (usando columna 'categoria' del punto #1)
+    gastos_df = movimientos_df[movimientos_df["monto"] < 0].copy()
+    gastos_df["monto_abs"] = gastos_df["monto"].abs()
+    gastos_categoria = gastos_df.groupby("categoria")["monto_abs"].sum().reset_index()
+    gastos_categoria = gastos_categoria.sort_values("monto_abs", ascending=False)
+
+    fig_categoria = px.pie(
+        gastos_categoria,
+        values="monto_abs",
+        names="categoria",
+        title="Distribución de Gastos por Categoría",
+        color_discrete_sequence=px.colors.qualitative.Set3,
+        hole=0.3,
+    )
+    fig_categoria.update_traces(textposition="inside", textinfo="percent+label")
+
+    # 2. Gráfica de proveedores (top 10)
+    top_proveedores = proveedores_report.head(10)
+    fig_proveedores = px.bar(
+        top_proveedores,
+        x="proveedor",
+        y="total_comprado",
+        title="Top 10 Proveedores por Monto",
+        labels={"total_comprado": "Total Comprado ($)", "proveedor": "Proveedor"},
+        color="total_comprado",
+        color_continuous_scale="Blues",
+    )
+    fig_proveedores.update_layout(xaxis_tickangle=-45)
+
+    # 3. Gráfica de bancos
+    fig_bancos = px.pie(
+        banco_report,
+        values="total_monto",
+        names="banco_origen",
+        title="Distribución de Movimientos por Banco",
+        color_discrete_sequence=px.colors.qualitative.Pastel,
+    )
+    fig_bancos.update_traces(textposition="inside", textinfo="percent+label")
+
+    # 4. Gráfica de tendencia histórica (si existe columna 'mes' o agrupamos por fecha)
+    if "fecha" in movimientos_df.columns and not movimientos_df.empty:
+        # Agrupar por mes (asumiendo que fecha es datetime)
+        movimientos_df["mes"] = movimientos_df["fecha"].dt.to_period("M").astype(str)
+        tendencia = movimientos_df.groupby("mes")["monto"].sum().reset_index()
+        tendencia = tendencia.sort_values("mes")
+
+        fig_tendencia = px.line(
+            tendencia,
+            x="mes",
+            y="monto",
+            title="Evolución del Flujo de Caja Mensual",
+            labels={"monto": "Flujo Neto ($)", "mes": "Mes"},
+            markers=True,
         )
-
-    # 2. No conciliadas con factura (del punto #8)
-    if "conciliado" in df.columns:
-        condiciones.append(df["conciliado"] == False)
-
-    # 3. Monto extremo (opcional: fuera de 3 desviaciones estándar)
-    if "monto" in df.columns:
-        mean = df["monto"].mean()
-        std = df["monto"].std()
-        if std > 0:
-            condiciones.append(
-                (df["monto"] > mean + 3 * std) | (df["monto"] < mean - 3 * std)
-            )
-
-    # 4. Faltan datos críticos
-    if "nit_cliente" in df.columns:
-        condiciones.append(df["nit_cliente"].isna())
-    if "descripcion" in df.columns:
-        condiciones.append(df["descripcion"].str.len() < 5)
-
-    # Combinar condiciones con OR (cualquier condición se considera excepción)
-    if condiciones:
-        mascara_excepcion = pd.concat(condiciones, axis=1).any(axis=1)
+        fig_tendencia.add_hline(y=0, line_dash="dash", line_color="red")
     else:
-        mascara_excepcion = pd.Series([False] * len(df))
-
-    return df[mascara_excepcion].copy()
-
-
-# ------------------------------------------------------------
-# 2. GENERAR ARCHIVO PARA REVISIÓN HUMANA (EXCEL)
-# ------------------------------------------------------------
-def generar_cola_revision(
-    df_excepciones: pd.DataFrame, nombre_archivo: str = None, directorio: str = None
-) -> str:
-    """
-    Exporta las excepciones a un archivo Excel editable.
-    Incluye columnas adicionales para que el humano pueda corregir:
-    - categoria_corregida
-    - nit_corregido
-    - conciliado_manual
-    - observaciones
-
-    Returns:
-        Ruta del archivo generado.
-    """
-    if directorio is None:
-        directorio = config_exc.directorio_revision
-
-    # Crear directorio si no existe
-    os.makedirs(directorio, exist_ok=True)
-
-    if nombre_archivo is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        nombre_archivo = f"cola_revision_{timestamp}.xlsx"
-
-    ruta_completa = os.path.join(directorio, nombre_archivo)
-
-    # Copiar DataFrame y agregar columnas para corrección manual
-    df_revision = df_excepciones.copy()
-
-    # Añadir columnas vacías para que el humano llene
-    df_revision["categoria_corregida"] = ""
-    df_revision["nit_corregido"] = ""
-    df_revision["conciliado_manual"] = False
-    df_revision["observaciones"] = ""
-    df_revision["revisado"] = False
-
-    # Añadir un hash de la fila para trazabilidad
-    df_revision["hash_fila"] = df_revision.apply(
-        lambda row: hashlib.md5(str(row.to_dict()).encode()).hexdigest()[:8], axis=1
-    )
-
-    # Guardar a Excel
-    with pd.ExcelWriter(ruta_completa, engine="openpyxl") as writer:
-        df_revision.to_excel(writer, sheet_name="Excepciones", index=False)
-
-        # Añadir hoja de instrucciones
-        instrucciones = pd.DataFrame(
-            {
-                "Instrucciones": [
-                    "1. Revisa cada transacción marcada como excepción.",
-                    '2. Corrige la categoría en la columna "categoria_corregida".',
-                    '3. Si conoces el NIT, escríbelo en "nit_corregido".',
-                    '4. Marca "conciliado_manual" como TRUE si ya fue conciliado.',
-                    "5. Añade observaciones si es necesario.",
-                    '6. Marca "revisado" como TRUE cuando termines.',
-                    "7. Guarda el archivo y ejecuta el script de reintento.",
-                ]
-            }
+        # Si no hay datos históricos, crear una gráfica vacía con mensaje
+        fig_tendencia = go.Figure()
+        fig_tendencia.add_annotation(
+            text="No hay datos históricos suficientes para mostrar tendencia",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(size=14),
         )
-        instrucciones.to_excel(writer, sheet_name="Instrucciones", index=False)
+        fig_tendencia.update_layout(title="Evolución del Flujo de Caja Mensual")
 
-    print(f"📋 Cola de revisión generada en: {ruta_completa}")
-    print(f"   Transacciones pendientes: {len(df_revision)}")
-    return ruta_completa
-
-
-# ------------------------------------------------------------
-# 3. FUNCIÓN DE REINTENTO (PROCESAR CORRECCIONES HUMANAS)
-# ------------------------------------------------------------
-def procesar_reintentos(
-    archivo_revision: str, df_original: pd.DataFrame, funcion_procesamiento: callable
-) -> dict:
-    """
-    Lee el archivo Excel corregido por el humano y procesa las transacciones.
-
-    Args:
-        archivo_revision: Ruta del Excel con correcciones.
-        df_original: DataFrame original con todas las transacciones.
-        funcion_procesamiento: Función que recibe una fila corregida y la procesa
-                               (ej. crea comprobante en Siigo, actualiza factura, etc.)
-
-    Returns:
-        Diccionario con estadísticas del reintento.
-    """
-    if not os.path.exists(archivo_revision):
-        return {"error": f"Archivo no encontrado: {archivo_revision}"}
-
-    # Cargar el archivo corregido
-    df_revision = pd.read_excel(archivo_revision, sheet_name="Excepciones")
-
-    # Filtrar solo las filas que fueron revisadas
-    df_revisadas = df_revision[df_revision["revisado"] == True].copy()
-
-    if df_revisadas.empty:
-        return {
-            "total_revisadas": 0,
-            "procesadas": 0,
-            "errores": 0,
-            "mensaje": "No hay transacciones marcadas como revisadas.",
-        }
-
-    resultados = {
-        "total_revisadas": len(df_revisadas),
-        "procesadas": 0,
-        "errores": 0,
-        "detalle_errores": [],
-    }
-
-    # Procesar cada fila corregida
-    for idx, row in df_revisadas.iterrows():
-        try:
-            # Buscar la transacción original (usando hash o algún identificador)
-            # En este ejemplo, usamos el hash_fila
-            hash_fila = row.get("hash_fila")
-            if hash_fila:
-                # Buscar en el DataFrame original (podrías tenerlo guardado)
-                # Aquí simulamos que funcion_procesamiento recibe la fila corregida
-                resultado = funcion_procesamiento(row)
-                if resultado.get("exito", False):
-                    resultados["procesadas"] += 1
-                else:
-                    resultados["errores"] += 1
-                    resultados["detalle_errores"].append(
-                        {
-                            "fila": idx,
-                            "error": resultado.get("mensaje", "Error desconocido"),
-                        }
-                    )
-            else:
-                # Si no hay hash, intentar por otros campos (fecha, monto, descripción)
-                # Esto es menos robusto pero puede funcionar
-                # ...
-                pass
-        except Exception as e:
-            resultados["errores"] += 1
-            resultados["detalle_errores"].append({"fila": idx, "error": str(e)})
-
-    # Generar reporte del reintento
-    generar_reporte_reintento(resultados, archivo_revision)
-
-    return resultados
-
-
-# ------------------------------------------------------------
-# 4. GENERAR REPORTE DEL REINTENTO
-# ------------------------------------------------------------
-def generar_reporte_reintento(resultados: dict, archivo_original: str):
-    """
-    Genera un pequeño reporte en TXT con los resultados del reintento.
-    """
-    nombre_reporte = f"reporte_reintento_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    with open(nombre_reporte, "w") as f:
-        f.write("=== REPORTE DE REINTENTO ===\n")
-        f.write(f"Archivo revisado: {archivo_original}\n")
-        f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(
-            f"Total transacciones revisadas: {resultados.get('total_revisadas', 0)}\n"
+    # 5. (Opcional) Gráfica de conciliación (si existe)
+    if conciliacion_df is not None and not conciliacion_df.empty:
+        conciliado_count = conciliacion_df["conciliado"].value_counts()
+        fig_conciliacion = px.bar(
+            x=["No Conciliadas", "Conciliadas"],
+            y=[conciliado_count.get(False, 0), conciliado_count.get(True, 0)],
+            title="Estado de Conciliación",
+            labels={"x": "Estado", "y": "Número de Transacciones"},
+            color=["No Conciliadas", "Conciliadas"],
+            color_discrete_sequence=["#EF553B", "#00CC96"],
         )
-        f.write(f"Procesadas exitosamente: {resultados.get('procesadas', 0)}\n")
-        f.write(f"Errores: {resultados.get('errores', 0)}\n")
+    else:
+        fig_conciliacion = go.Figure()
+        fig_conciliacion.add_annotation(
+            text="No hay datos de conciliación disponibles",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(size=14),
+        )
+        fig_conciliacion.update_layout(title="Estado de Conciliación")
 
-        if resultados.get("detalle_errores"):
-            f.write("\n--- DETALLE DE ERRORES ---\n")
-            for err in resultados["detalle_errores"]:
-                f.write(
-                    f"Fila {err.get('fila', 'N/A')}: {err.get('error', 'Sin detalle')}\n"
-                )
+    # --- Convertir gráficas a HTML (divs) ---
+    html_categoria = fig_categoria.to_html(full_html=False)
+    html_proveedores = fig_proveedores.to_html(full_html=False)
+    html_bancos = fig_bancos.to_html(full_html=False)
+    html_tendencia = fig_tendencia.to_html(full_html=False)
+    html_conciliacion = fig_conciliacion.to_html(full_html=False)
 
-    print(f"📄 Reporte de reintento generado: {nombre_reporte}")
-
-
-# ------------------------------------------------------------
-# 5. FUNCIÓN DE PROCESAMIENTO DE UNA FILA CORREGIDA (EJEMPLO)
-# ------------------------------------------------------------
-def procesar_fila_corregida(fila_corregida: pd.Series, config: dict) -> dict:
-    """
-    Esta función recibe una fila corregida y la procesa.
-    Debes adaptarla a tu lógica específica (crear comprobante, actualizar factura, etc.)
-    """
-    try:
-        # Extraer datos corregidos
-        categoria = fila_corregida.get("categoria_corregida", "")
-        nit = fila_corregida.get("nit_corregido", "")
-        conciliado = fila_corregida.get("conciliado_manual", False)
-
-        # Aquí iría la lógica de:
-        # - Actualizar la categoría en la base de datos local
-        # - Si tiene NIT, buscar/crear el tercero en Siigo
-        # - Si está conciliado manualmente, marcar la factura como pagada
-        # - Reintentar la creación del comprobante en Siigo
-
-        # Simulación:
-        print(f"🔄 Procesando fila: {fila_corregida.get('hash_fila')}")
-        print(f"   Categoría corregida: {categoria}")
-        print(f"   NIT corregido: {nit}")
-
-        # Ejemplo: Si la categoría ahora es válida, la procesamos
-        if categoria and categoria != "Otros":
-            # Llamar a la función de creación de comprobante (punto #3)
-            # resultado = crear_comprobante_siigo(fila_corregida)
-            return {"exito": True, "mensaje": "Procesado correctamente"}
+    # --- Generar tablas en HTML ---
+    def dataframe_to_html(df, max_rows=15):
+        if df is None or df.empty:
+            return "<p><em>No hay datos disponibles</em></p>"
+        # Limitar filas para no hacer el HTML pesado
+        if len(df) > max_rows:
+            df = df.head(max_rows)
+            nota = f"<p><small>Mostrando {max_rows} de {len(df)} registros</small></p>"
         else:
-            return {"exito": False, "mensaje": "Categoría no válida"}
+            nota = ""
+        return df.to_html(classes="table table-striped", index=False) + nota
 
-    except Exception as e:
-        return {"exito": False, "mensaje": str(e)}
-
-
-# ------------------------------------------------------------
-# 6. INTEGRACIÓN CON EL FLUJO PRINCIPAL (PUNTO #8 Y #10)
-# ------------------------------------------------------------
-def integrar_cola_revision(
-    df: pd.DataFrame,
-    errores_globales: list,
-    resumen_global: dict,
-    config_exc: ConfiguracionExcepciones = None,
-) -> dict:
+    # --- Construir HTML final ---
+    html_template = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Reporte Ejecutivo - Automatización Contable</title>
+        <style>
+            * {{
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }}
+            body {{
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: #f4f6f9;
+                padding: 20px;
+                color: #333;
+            }}
+            .container {{
+                max-width: 1400px;
+                margin: 0 auto;
+                background: white;
+                padding: 30px;
+                border-radius: 12px;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+            }}
+            h1 {{
+                color: #1a3c6e;
+                border-bottom: 3px solid #1a3c6e;
+                padding-bottom: 10px;
+                margin-bottom: 20px;
+                font-weight: 600;
+            }}
+            h2 {{
+                color: #2c3e50;
+                margin-top: 30px;
+                margin-bottom: 15px;
+                padding-bottom: 8px;
+                border-bottom: 2px solid #eaeef2;
+            }}
+            .kpi-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 20px;
+                margin: 20px 0 30px 0;
+            }}
+            .kpi-card {{
+                background: #f8fafc;
+                padding: 20px;
+                border-radius: 10px;
+                text-align: center;
+                border-left: 5px solid #1a3c6e;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            }}
+            .kpi-card .numero {{
+                font-size: 28px;
+                font-weight: 700;
+                color: #1a3c6e;
+            }}
+            .kpi-card .etiqueta {{
+                font-size: 14px;
+                color: #6c7a8a;
+                margin-top: 5px;
+            }}
+            .chart-grid {{
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 25px;
+                margin: 20px 0;
+            }}
+            .chart-box {{
+                background: #ffffff;
+                padding: 15px;
+                border-radius: 8px;
+                box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+                border: 1px solid #e9edf2;
+            }}
+            .chart-box.full-width {{
+                grid-column: 1 / -1;
+            }}
+            .table-container {{
+                overflow-x: auto;
+                margin: 15px 0;
+                background: #fafbfc;
+                padding: 15px;
+                border-radius: 8px;
+                border: 1px solid #e9edf2;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 14px;
+            }}
+            table th {{
+                background: #1a3c6e;
+                color: white;
+                padding: 10px 12px;
+                text-align: left;
+            }}
+            table td {{
+                padding: 8px 12px;
+                border-bottom: 1px solid #e9edf2;
+            }}
+            table tr:hover {{
+                background: #f1f4f8;
+            }}
+            .error-log {{
+                background: #fef6f6;
+                border-left: 5px solid #e74c3c;
+                padding: 15px 20px;
+                margin: 20px 0;
+                border-radius: 6px;
+            }}
+            .error-log .error-item {{
+                padding: 8px 0;
+                border-bottom: 1px solid #f0d6d6;
+            }}
+            .error-log .error-item:last-child {{
+                border-bottom: none;
+            }}
+            .error-log strong {{
+                color: #c0392b;
+            }}
+            .footer {{
+                margin-top: 30px;
+                text-align: center;
+                font-size: 12px;
+                color: #95a5a6;
+                border-top: 1px solid #eaeef2;
+                padding-top: 20px;
+            }}
+            @media (max-width: 768px) {{
+                .chart-grid {{
+                    grid-template-columns: 1fr;
+                }}
+                .container {{
+                    padding: 15px;
+                }}
+            }}
+        </style>
+        <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📊 Reporte Ejecutivo - Automatización Contable</h1>
+            <p style="color: #6c7a8a; margin-bottom: 20px;">
+                Generado el {datetime.now().strftime('%d de %B de %Y a las %H:%M')}
+            </p>
+            
+            <!-- KPIs -->
+            <div class="kpi-grid">
+                <div class="kpi-card">
+                    <div class="numero">{resumen.get('total_movimientos', len(movimientos_df))}</div>
+                    <div class="etiqueta">Total Transacciones</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="numero">${resumen.get('total_gastos', gastos_df['monto_abs'].sum() if not gastos_df.empty else 0):,.0f}</div>
+                    <div class="etiqueta">Total Gastos</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="numero">{resumen.get('conciliaciones_exitosas', 0)}</div>
+                    <div class="etiqueta">Transacciones Conciliadas</div>
+                </div>
+                <div class="kpi-card" style="border-left-color: {'#27ae60' if not errores else '#e74c3c'};">
+                    <div class="numero">{len(errores)}</div>
+                    <div class="etiqueta">{'✅ Sin Errores' if not errores else '⚠️ Errores Detectados'}</div>
+                </div>
+            </div>
+            
+            <!-- Gráficas -->
+            <h2>📈 Análisis Gráfico</h2>
+            <div class="chart-grid">
+                <div class="chart-box">{html_categoria}</div>
+                <div class="chart-box">{html_bancos}</div>
+                <div class="chart-box full-width">{html_tendencia}</div>
+                <div class="chart-box">{html_proveedores}</div>
+                <div class="chart-box">{html_conciliacion}</div>
+            </div>
+            
+            <!-- Tablas de Detalle -->
+            <h2>📋 Tablas de Detalle</h2>
+            
+            <h3>🏢 Top Proveedores</h3>
+            <div class="table-container">
+                {dataframe_to_html(proveedores_report, max_rows=15)}
+            </div>
+            
+            <h3>🏦 Distribución por Bancos</h3>
+            <div class="table-container">
+                {dataframe_to_html(banco_report, max_rows=10)}
+            </div>
+            
+            {f'''<h3>👥 Resumen de Nómina</h3>
+            <div class="table-container">
+                {dataframe_to_html(nomina_report, max_rows=10)}
+            </div>''' if nomina_report is not None and not nomina_report.empty else ''}
+            
+            {f'''<h3>🔗 Detalle de Conciliación</h3>
+            <div class="table-container">
+                {dataframe_to_html(conciliacion_df[conciliacion_df['conciliado'] == True].head(20), max_rows=20)}
+            </div>''' if conciliacion_df is not None and not conciliacion_df.empty else ''}
+            
+            <!-- Errores (si los hay) -->
+            {f'''
+            <h2>⚠️ Log de Errores</h2>
+            <div class="error-log">
+                <p><strong>Se detectaron {len(errores)} error(es) durante la ejecución:</strong></p>
+                {"".join([f'<div class="error-item"><strong>{e.get("entidad", "Desconocida")}:</strong> {e.get("motivo", "Sin descripción")} {f"<br><small>Detalle: {e.get('detalle', '')}</small>" if e.get("detalle") else ""}</div>' for e in errores])}
+            </div>
+            ''' if errores else ''}
+            
+            <div class="footer">
+                Reporte generado automáticamente por el Script de Automatización Contable &bull; {datetime.now().year}
+            </div>
+        </div>
+    </body>
+    </html>
     """
-    Función de integración que une el punto #11 con los puntos #8 y #10.
 
-    Args:
-        df: DataFrame con todas las transacciones procesadas.
-        errores_globales: Lista de errores acumulados (del punto #10).
-        resumen_global: Diccionario con el resumen del proceso.
-        config_exc: Configuración de excepciones.
+    # Guardar archivo
+    with open(nombre_archivo, "w", encoding="utf-8") as f:
+        f.write(html_template)
 
-    Returns:
-        Diccionario con el estado de la cola de revisión.
-    """
-    if config_exc is None:
-        config_exc = ConfiguracionExcepciones()
-
-    # 1. Detectar excepciones en el DataFrame (integración con #1 y #8)
-    df_excepciones = detectar_excepciones(df)
-
-    if df_excepciones.empty:
-        print("✅ No se detectaron excepciones. Todo procesado correctamente.")
-        return {"tiene_excepciones": False, "cantidad": 0, "archivo": None}
-
-    # 2. Si hay excepciones, generar archivo de revisión
-    print(
-        f"⚠️ Se detectaron {len(df_excepciones)} excepciones. Generando cola de revisión..."
-    )
-    archivo_revision = generar_cola_revision(df_excepciones)
-
-    # 3. Agregar a la lista de errores (para notificación #10)
-    errores_globales.append(
-        {
-            "entidad": "Sistema",
-            "motivo": f"Se generaron {len(df_excepciones)} excepciones para revisión humana",
-            "detalle": f"Revisar archivo: {archivo_revision}",
-        }
-    )
-
-    # 4. Actualizar el resumen global (para #10)
-    resumen_global["excepciones_pendientes"] = len(df_excepciones)
-    resumen_global["archivo_revision"] = archivo_revision
-
-    # 5. Retornar información de la cola
-    return {
-        "tiene_excepciones": True,
-        "cantidad": len(df_excepciones),
-        "archivo": archivo_revision,
-        "mensaje": f"Se generó cola de revisión con {len(df_excepciones)} transacciones",
-    }
-
-
-# ------------------------------------------------------------
-# EJEMPLO DE USO INTEGRADO
-# ------------------------------------------------------------
-if __name__ == "__main__":
-    # Simulación de DataFrame con transacciones (de los puntos #1 y #8)
-    df_ejemplo = pd.DataFrame(
-        {
-            "fecha": ["2026-07-10", "2026-07-12", "2026-07-15"],
-            "descripcion": [
-                "Pago a Protoquímica",
-                "Ingreso Frutesa",
-                "Compra desconocida",
-            ],
-            "monto": [-1500000, 2500000, -800000],
-            "categoria": ["Inorgánicos", "Ventas", "Otros"],  # <-- Una excepción
-            "conciliado": [True, True, False],  # <-- Otra excepción
-            "nit_cliente": ["800123456-0", "900987654-1", None],  # <-- Otra excepción
-        }
-    )
-
-    # Inicializar listas globales (integración con #10)
-    errores_globales = []
-    resumen_global = {"total_movimientos": len(df_ejemplo)}
-
-    # Ejecutar integración del punto #11
-    resultado_cola = integrar_cola_revision(
-        df_ejemplo, errores_globales, resumen_global
-    )
-
-    print("\n📊 Resultado de integración:")
-    print(resultado_cola)
-
-    # Verificar que los errores se hayan añadido (para #10)
-    print("\n📋 Errores globales acumulados:")
-    for err in errores_globales:
-        print(f"  - {err.get('entidad')}: {err.get('motivo')}")
-
-    print("\n📊 Resumen global actualizado:")
-    print(resumen_global)
+    print(f"✅ Reporte HTML generado: {nombre_archivo}")
+    return nombre_archivo
