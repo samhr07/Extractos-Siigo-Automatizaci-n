@@ -1,188 +1,274 @@
+import time
+import json
+import os
+import hashlib
+import requests
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
 import pandas as pd
-import re
-
-# ------------------------------------------------------------
-# 1. CONFIGURACIÓN
-# ------------------------------------------------------------
-TASA_GMF = 0.004  # 4x1000 (0.4%)
-UMBRAL_DISCREPANCIA = 0.50  # Si la diferencia supera $0.50, generamos alerta
-
-
-# ------------------------------------------------------------
-# 2. FUNCIONES DE DETECCIÓN Y CÁLCULO
-# ------------------------------------------------------------
-def es_transaccion_gmf(descripcion):
-    """
-    Detecta si una transacción es un cargo por GMF basado en palabras clave.
-    """
-    if not isinstance(descripcion, str) or pd.isna(descripcion):
-        return False
-    desc_lower = descripcion.lower()
-    patrones_gmf = [r"4x1000", r"4\s*x\s*1000", r"gmf", r"gravamen", r"impuesto\s*4"]
-    for patron in patrones_gmf:
-        if re.search(patron, desc_lower):
-            return True
-    return False
-
-
-def calcular_gmf_esperado(monto_retiro):
-    """
-    Calcula el GMF esperado (0.4%) sobre un monto de retiro.
-    El resultado se redondea a 2 decimales.
-    """
-    if monto_retiro >= 0:
-        return 0.0  # Solo aplica a retiros (montos negativos)
-    # Tomamos el valor absoluto y aplicamos tasa
-    return round(abs(monto_retiro) * TASA_GMF, 2)
-
-
-def extraer_gmf_real(descripcion):
-    """
-    Intenta extraer el monto del GMF directamente de la descripción.
-    Busca patrones como: "GMF $X.XX" o "4x1000 $X.XX"
-    """
-    if not isinstance(descripcion, str) or pd.isna(descripcion):
-        return None
-    desc_lower = descripcion.lower()
-    # Patrones: número con punto decimal precedido de $ o GMF
-    patrones = [
-        r"(?:gmf|4x1000|gravamen).*?(\d+\.\d{2})",
-        r"(?:valor|monto).*?(\d+\.\d{2})",  # menos preciso, pero captura
-    ]
-    for patron in patrones:
-        match = re.search(patron, desc_lower)
-        if match:
-            return float(match.group(1))
-    return None
-
-
-def clasificar_y_calcular_gmf(row):
-    """
-    Aplica la lógica completa a cada transacción.
-    Retorna un diccionario con:
-    - es_gmf: bool
-    - gmf_real: float (extraído de descripción) o None
-    - gmf_esperado: float (calculado)
-    - diferencia: float
-    """
-    monto = row["monto"]
-    descripcion = row.get("descripcion", "")
-
-    # Solo procesamos egresos (retiros)
-    if monto >= 0:
-        return {
-            "es_gmf": False,
-            "gmf_real": None,
-            "gmf_esperado": None,
-            "diferencia": None,
-        }
-
-    # Calcular GMF esperado
-    gmf_esperado = calcular_gmf_esperado(monto)
-
-    # Detectar si la descripción indica GMF
-    es_gmf = es_transaccion_gmf(descripcion)
-
-    # Intentar extraer GMF real
-    gmf_real = extraer_gmf_real(descripcion) if es_gmf else None
-
-    # Si es GMF pero no se extrajo el monto, podemos usar el esperado como real (para alerta)
-    if es_gmf and gmf_real is None:
-        gmf_real = gmf_esperado
-
-    # Calcular diferencia (solo si ambos existen)
-    if gmf_real is not None and gmf_esperado is not None:
-        diferencia = round(gmf_real - gmf_esperado, 2)
-    else:
-        diferencia = None
-
-    return {
-        "es_gmf": es_gmf,
-        "gmf_real": gmf_real,
-        "gmf_esperado": gmf_esperado,
-        "diferencia": diferencia,
-    }
-
-
-# ------------------------------------------------------------
-# 3. APLICACIÓN AL DATAFRAME
-# ------------------------------------------------------------
-# Suponemos que df tiene columnas: 'descripcion' y 'monto'
-# df = pd.read_csv('tus_extractos.csv')  # <-- Descomenta y ajusta
-
-# Aplicar función a cada fila
-resultados_gmf = df.apply(clasificar_y_calcular_gmf, axis=1)
-df_gmf = pd.DataFrame(resultados_gmf.tolist(), index=df.index)
-
-# Unir al DataFrame original
-df = pd.concat([df, df_gmf], axis=1)
-
-# ------------------------------------------------------------
-# 4. CLASIFICACIÓN AUTOMÁTICA COMO IMPUESTO
-#    (Consistente con el punto #1)
-# ------------------------------------------------------------
-# Si es GMF (real o detectado) y ya tiene categoría, la reemplazamos por "Impuestos"
-mask_gmf = df["es_gmf"] == True
-df.loc[mask_gmf, "categoria"] = "Impuestos"
-# Si no estaba como GMF pero el gmf_esperado > 0 y la descripción tiene palabras clave, también
-mask_por_calculo = (df["gmf_esperado"] > 0) & (
-    df["descripcion"].str.contains("4x1000|gmf|gravamen", case=False, na=False)
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
 )
-df.loc[mask_por_calculo, "categoria"] = "Impuestos"
+
 
 # ------------------------------------------------------------
-# 5. GENERAR ALERTAS POR DISCREPANCIAS
+# CONFIGURACIÓN (ampliada y corregida)
 # ------------------------------------------------------------
-discrepancias = df[
-    (df["diferencia"].notna()) & (abs(df["diferencia"]) > UMBRAL_DISCREPANCIA)
-].copy()
+class ConfiguracionAutomatizacion:
+    # Credenciales Siigo
+    siigo_username: str = "TU_USERNAME_API"
+    siigo_access_key: str = "TU_ACCESS_KEY"
+    siigo_partner_id: str = "MiScriptConciliacion"
 
-if not discrepancias.empty:
-    print("⚠️ ALERTA: Discrepancias en GMF detectadas (diferencia > $0.50)")
-    print("============================================================")
-    print(
-        discrepancias[
-            ["fecha", "descripcion", "monto", "gmf_real", "gmf_esperado", "diferencia"]
-        ].to_string(index=False)
-    )
+    # Datos bancarios (simplificados para el ejemplo)
+    # ... (mantén los que ya tenías)
 
-    # Guardar reporte detallado
-    with pd.ExcelWriter("alertas_gmf.xlsx") as writer:
-        discrepancias[
-            [
-                "fecha",
-                "descripcion",
-                "monto",
-                "gmf_real",
-                "gmf_esperado",
-                "diferencia",
-                "categoria",
-            ]
-        ].to_excel(writer, sheet_name="Discrepancias GMF", index=False)
-        # También guardamos todas las transacciones de GMF para referencia
-        df[df["es_gmf"] | mask_por_calculo][
-            ["fecha", "descripcion", "monto", "gmf_real", "gmf_esperado", "diferencia"]
-        ].to_excel(writer, sheet_name="Todos los GMF", index=False)
-    print(f"✅ Reporte de discrepancias guardado en 'alertas_gmf.xlsx'")
-else:
-    print("✅ No se encontraron discrepancias significativas en el GMF.")
+    # Parámetros de control
+    delay_bancos_segundos: int = 15
+    timeout_siigo: int = 120
+    max_retries: int = 3
+    directorio_pdfs: str = "./extractos_manuales/"
+
+
+config = ConfiguracionAutomatizacion()
+
 
 # ------------------------------------------------------------
-# 6. VISUALIZACIÓN RÁPIDA (Opcional)
+# 1. AUTENTICACIÓN Y TOKEN JWT
 # ------------------------------------------------------------
-print("\n📊 Resumen de cargos por GMF (calculados vs reales)")
-resumen_gmf = df[df["gmf_esperado"] > 0].copy()
-if not resumen_gmf.empty:
-    resumen_gmf["gmf_calculado_total"] = resumen_gmf["gmf_esperado"].sum()
-    resumen_gmf["gmf_real_total"] = (
-        resumen_gmf["gmf_real"].fillna(resumen_gmf["gmf_esperado"]).sum()
+def obtener_token_siigo(username: str, access_key: str) -> str:
+    """Obtiene token JWT de Siigo y lo devuelve."""
+    url = "https://api.siigo.com/v1/auth"
+    payload = {"username": username, "access_key": access_key}
+    try:
+        resp = requests.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+        token = resp.json().get("access_token")
+        if not token:
+            raise ValueError("Token no recibido")
+        return token
+    except Exception as e:
+        raise RuntimeError(f"Error autenticando con Siigo: {e}")
+
+
+# ------------------------------------------------------------
+# 2. FUNCIÓN DE REINTENTO CON BACKOFF (para rate limits 429)
+# ------------------------------------------------------------
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=60),
+    retry=retry_if_exception_type(requests.exceptions.HTTPError),
+)
+def request_con_retry(method, url, headers=None, json=None, params=None, timeout=120):
+    """Realiza petición HTTP con reintentos automáticos en caso de 429 o 5xx."""
+    headers = headers or {}
+    resp = requests.request(
+        method, url, headers=headers, json=json, params=params, timeout=timeout
     )
-    print(
-        f"Total GMF calculado (0.4% sobre retiros): ${resumen_gmf['gmf_esperado'].sum():.2f}"
+
+    if resp.status_code == 429:
+        # Si la API devuelve Retry-After, usamos ese tiempo
+        retry_after = int(resp.headers.get("Retry-After", 5))
+        time.sleep(retry_after)
+        resp.raise_for_status()  # Forzamos reintento
+    elif resp.status_code >= 500:
+        resp.raise_for_status()  # Reintentará por tenacity
+    else:
+        resp.raise_for_status()
+    return resp
+
+
+# ------------------------------------------------------------
+# 3. OBTENER FACTURAS ELECTRÓNICAS (pendientes de pago)
+# ------------------------------------------------------------
+def obtener_facturas_pendientes(
+    token: str, partner_id: str, customer_id: Optional[str] = None
+) -> List[Dict]:
+    """Obtiene facturas emitidas (o recibidas) que estén pendientes de pago."""
+    headers = {"Authorization": f"Bearer {token}", "Partner-Id": partner_id}
+    params = {"status": "issued", "limit": 100}  # Ajusta según necesidad
+    if customer_id:
+        params["customer"] = customer_id
+
+    url = "https://api.siigo.com/v1/invoices"
+    try:
+        resp = request_con_retry(
+            "GET", url, headers=headers, params=params, timeout=config.timeout_siigo
+        )
+        facturas = resp.json()
+        # Filtramos solo las que están pendientes (campo 'paid' o 'status' según la API)
+        # En la API de Siigo, el campo 'paid' es booleano; también 'status' puede ser 'issued'/'paid'
+        pendientes = [f for f in facturas if not f.get("paid", False)]
+        return pendientes
+    except Exception as e:
+        print(f"❌ Error obteniendo facturas pendientes: {e}")
+        return []
+
+
+# ------------------------------------------------------------
+# 4. CONCILIACIÓN: CRUZAR MOVIMIENTOS BANCARIOS CON FACTURAS
+# ------------------------------------------------------------
+def conciliar_facturas(movimientos: pd.DataFrame, facturas: List[Dict]) -> pd.DataFrame:
+    """
+    Cruza los movimientos bancarios (egresos/ingresos) con las facturas pendientes.
+    Retorna un DataFrame con el resultado de la conciliación.
+    """
+    # Asegurar que tenemos las columnas necesarias en movimientos: fecha, monto, nit_cliente, descripcion
+    # Si no tienes NIT, puedes usar coincidencia difusa por nombre (pero asumimos que tienes NIT)
+    resultados = []
+
+    for _, mov in movimientos.iterrows():
+        # Solo nos interesan los egresos (pagos a proveedores) o ingresos (cobros a clientes)
+        # Para este ejemplo, asumimos que queremos conciliar tanto pagos como cobros
+        monto_abs = abs(mov["monto"])
+        fecha_mov = mov["fecha"]
+        nit = mov.get("nit_cliente", None)  # Si no hay NIT, podemos intentar con nombre
+
+        # Buscar factura que coincida en NIT, monto aprox y fecha cercana
+        factura_match = None
+        mejor_similitud = 0
+
+        for fact in facturas:
+            # Extraer datos de la factura
+            nit_fact = fact.get("customer", {}).get("identification", "")
+            monto_fact = float(fact.get("total", 0))
+            fecha_fact = datetime.strptime(
+                fact.get("date", "1970-01-01"), "%Y-%m-%d"
+            ).date()
+            # Permitir diferencia de ±5 días
+            if abs((fecha_mov - fecha_fact).days) > 5:
+                continue
+            # Comparar montos con tolerancia del 1%
+            if abs(monto_fact - monto_abs) / max(monto_abs, 1) > 0.01:
+                continue
+            # Si tenemos NIT, comparamos exacto
+            if nit and nit_fact and nit == nit_fact:
+                factura_match = fact
+                break
+            # Si no, usar coincidencia difusa en nombre (aquí simplificamos)
+            # Podrías usar fuzzywuzzy para mejorar
+            # ...
+
+        if factura_match:
+            # Marcar como conciliado
+            resultados.append(
+                {
+                    "movimiento": mov.to_dict(),
+                    "factura_id": factura_match.get("id"),
+                    "factura_numero": factura_match.get("number"),
+                    "conciliado": True,
+                }
+            )
+        else:
+            resultados.append(
+                {"movimiento": mov.to_dict(), "factura_id": None, "conciliado": False}
+            )
+
+    return pd.DataFrame(resultados)
+
+
+# ------------------------------------------------------------
+# 5. MARCAR FACTURA COMO PAGADA EN SIIGO (PATCH)
+# ------------------------------------------------------------
+def marcar_factura_pagada(
+    token: str, partner_id: str, factura_id: str, fecha_pago: str, idempotency_key: str
+) -> bool:
+    """Actualiza una factura para marcarla como pagada."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Partner-Id": partner_id,
+        "Idempotency-Key": idempotency_key,
+    }
+    payload = {"paid": True, "payment_date": fecha_pago}  # YYYY-MM-DD
+    url = f"https://api.siigo.com/v1/invoices/{factura_id}"
+    try:
+        resp = request_con_retry(
+            "PATCH", url, headers=headers, json=payload, timeout=config.timeout_siigo
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"❌ Error marcando factura {factura_id} como pagada: {e}")
+        return False
+
+
+# ------------------------------------------------------------
+# 6. FLUJO PRINCIPAL DE CONCILIACIÓN
+# ------------------------------------------------------------
+def ejecutar_conciliacion(
+    movimientos: pd.DataFrame, config: ConfiguracionAutomatizacion
+) -> Dict:
+    """
+    Orquesta la conciliación: obtiene token, facturas, cruza y actualiza.
+    Retorna un resumen con estadísticas.
+    """
+    # 1. Obtener token
+    token = obtener_token_siigo(config.siigo_username, config.siigo_access_key)
+
+    # 2. Obtener facturas pendientes
+    facturas = obtener_facturas_pendientes(token, config.siigo_partner_id)
+    print(f"📄 Facturas pendientes obtenidas: {len(facturas)}")
+
+    # 3. Conciliar movimientos
+    conciliacion_df = conciliar_facturas(movimientos, facturas)
+
+    # 4. Actualizar facturas conciliadas
+    actualizadas = 0
+    for _, row in conciliacion_df.iterrows():
+        if row["conciliado"] and row["factura_id"]:
+            factura_id = row["factura_id"]
+            fecha_mov = row["movimiento"]["fecha"].strftime("%Y-%m-%d")
+            # Generar clave de idempotencia única
+            idempotency_key = hashlib.sha256(
+                f"{factura_id}{fecha_mov}".encode()
+            ).hexdigest()[:30]
+            ok = marcar_factura_pagada(
+                token, config.siigo_partner_id, factura_id, fecha_mov, idempotency_key
+            )
+            if ok:
+                actualizadas += 1
+                print(f"✅ Factura {factura_id} marcada como pagada.")
+            else:
+                print(f"⚠️ Falló actualización de factura {factura_id}")
+
+    # 5. Resumen
+    resumen = {
+        "total_movimientos": len(movimientos),
+        "facturas_pendientes": len(facturas),
+        "conciliaciones_exitosas": conciliacion_df["conciliado"].sum(),
+        "facturas_actualizadas": actualizadas,
+    }
+    return resumen
+
+
+# ------------------------------------------------------------
+# 7. EJEMPLO DE USO (INTEGRADO CON TU CÓDIGO EXISTENTE)
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    # Simulación: cargar movimientos desde extractos (debes tener tu df)
+    # Suponiendo que ya tienes un DataFrame con los movimientos bancarios
+    # df_movimientos = cargar_tus_extractos()  # <-- tu función de extracción
+
+    # Si no tienes, creamos un ejemplo rápido
+    df_movimientos = pd.DataFrame(
+        {
+            "fecha": [datetime(2026, 7, 10), datetime(2026, 7, 12)],
+            "monto": [-1500000, -2500000],
+            "nit_cliente": ["800123456-0", "900987654-1"],
+            "descripcion": ["Pago factura 123", "Pago factura 456"],
+        }
     )
-    print(
-        f"Total GMF real (según extractos):       ${resumen_gmf['gmf_real'].fillna(resumen_gmf['gmf_esperado']).sum():.2f}"
-    )
-    print(
-        f"Diferencia total:                        ${(resumen_gmf['gmf_real'].fillna(resumen_gmf['gmf_esperado']).sum() - resumen_gmf['gmf_esperado'].sum()):.2f}"
-    )
+
+    # Ejecutar conciliación
+    resumen = ejecutar_conciliacion(df_movimientos, config)
+
+    # Imprimir reporte
+    print("\n📊 RESUMEN DE CONCILIACIÓN")
+    print("==========================")
+    for k, v in resumen.items():
+        print(f"{k}: {v}")
+
+    # Generar archivo Excel con detalle de conciliación
+    # (puedes guardar el DataFrame de conciliación)
