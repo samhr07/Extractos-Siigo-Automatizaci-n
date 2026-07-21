@@ -74,7 +74,7 @@ class ConfigEntorno:
         )
     )
     email_password: str = field(
-        default_factory=lambda: os.getenv("EMAIL_PASSWORD", "wijf ptwd aihv gphn")
+        default_factory=lambda: os.getenv("EMAIL_PASSWORD", "Rexyfiona2007.")
     )
     email_destinatario: str = field(
         default_factory=lambda: os.getenv(
@@ -118,7 +118,7 @@ class ConfigEntorno:
 
     # --- Cuentas PUC Estándar ---
     puc_banco: str = "11100501"  # Bancos cuentas corrientes
-    puc_gasto_gmf: str = "51159505"  # Gravamen Movimiento Financiero (4x1000)
+    puc_gasto_gmf: str = "511595"  # Gravamen Movimiento Financiero (4x1000)
     puc_clientes_default: str = "13050501"  # Clientes nacionales
     puc_proveedores_default: str = "22050501"  # Proveedores nacionales
 
