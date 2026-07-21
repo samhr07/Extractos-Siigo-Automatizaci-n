@@ -44,68 +44,100 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SiigoOrquestador")
 
+# ============================================================
+# CARGA DE CONFIGURACIÓN DESDE JSON CON VALIDACIÓN Y FALLBACK
+# ============================================================
 from pathlib import Path
 import json
+import os
 
 BASE_DIR = Path(__file__).resolve().parent
-
 CONFIG_DIR = BASE_DIR / "config"
 
 
-def cargar_json(nombre):
-
+def cargar_json(nombre: str, default: dict = None) -> dict:
+    """
+    Carga un archivo JSON desde el directorio config.
+    Si falla, retorna un dict vacío o el default proporcionado.
+    """
     ruta = CONFIG_DIR / nombre
+    if not ruta.exists():
+        logger.warning(f"Archivo de configuración no encontrado: {ruta}")
+        return default or {}
+    try:
+        with open(ruta, "r", encoding="utf-8") as archivo:
+            return json.load(archivo)
+    except json.JSONDecodeError as e:
+        logger.error(f"Error al decodificar JSON en {nombre}: {e}")
+        return default or {}
+    except Exception as e:
+        logger.error(f"Error al leer {nombre}: {e}")
+        return default or {}
 
-    with open(ruta, "r", encoding="utf-8") as archivo:
-        return json.load(archivo)
 
-
+# Cargar credenciales y catálogos
 CREDENCIALES = cargar_json("credenciales.json")
-
 CATALOGOS = cargar_json("catalogos.json")
 
 
 # ============================================================
-# CONFIGURACIÓN GENERAL Y VARIABLES DE ENTORNO (Dataclass)
+# CONFIGURACIÓN GENERAL (Dataclass con valores desde JSON + ENV)
 # ============================================================
 @dataclass
 class ConfigEntorno:
     # --- Siigo API ---
-    siigo_api_url: str = CREDENCIALES["siigo"]["api_url"]
-
-    siigo_username: str = CREDENCIALES["siigo"]["username"]
-
-    siigo_access_key: str = CREDENCIALES["siigo"]["access_key"]
-
-    siigo_partner_id: str = CREDENCIALES["siigo"]["partner_id"]
-
-    is_sandbox: str = CREDENCIALES["siigo"]["sandbox"]
-
-    timeout_siigo: str = CREDENCIALES["siigo"]["timeout"]
+    siigo_api_url: str = os.getenv("SIIGO_API_URL") or CREDENCIALES.get(
+        "siigo", {}
+    ).get("api_url", "https://api.siigo.com/v1")
+    siigo_username: str = os.getenv("SIIGO_USERNAME") or CREDENCIALES.get(
+        "siigo", {}
+    ).get("username", "")
+    siigo_access_key: str = os.getenv("SIIGO_ACCESS_KEY") or CREDENCIALES.get(
+        "siigo", {}
+    ).get("access_key", "")
+    siigo_partner_id: str = os.getenv("SIIGO_PARTNER_ID") or CREDENCIALES.get(
+        "siigo", {}
+    ).get("partner_id", "MiScriptConciliacion")
+    is_sandbox: bool = (
+        os.getenv("SIIGO_SANDBOX", "true").lower() == "true"
+        if os.getenv("SIIGO_SANDBOX")
+        else CREDENCIALES.get("siigo", {}).get("sandbox", True)
+    )
+    timeout_siigo: int = int(
+        os.getenv("SIIGO_TIMEOUT") or CREDENCIALES.get("siigo", {}).get("timeout", 120)
+    )
 
     # --- Notificaciones Email ---
-    email_remitente: str = CREDENCIALES["email"]["remitente"]
-
-    email_password: str = CREDENCIALES["email"]["password"]
-
-    email_destinatario: str = CREDENCIALES["email"]["destinatario"]
-
-    smtp_server: str = CREDENCIALES["email"]["smtp_server"]
-
-    smtp_port: str = CREDENCIALES["email"]["smtp_port"]
+    email_remitente: str = os.getenv("EMAIL_REMITENTE") or CREDENCIALES.get(
+        "email", {}
+    ).get("remitente", "")
+    email_password: str = os.getenv("EMAIL_PASSWORD") or CREDENCIALES.get(
+        "email", {}
+    ).get("password", "")
+    email_destinatario: str = os.getenv("EMAIL_DESTINATARIO") or CREDENCIALES.get(
+        "email", {}
+    ).get("destinatario", "")
+    smtp_server: str = os.getenv("SMTP_SERVER") or CREDENCIALES.get("email", {}).get(
+        "smtp_server", "smtp.gmail.com"
+    )
+    smtp_port: int = int(
+        os.getenv("SMTP_PORT") or CREDENCIALES.get("email", {}).get("smtp_port", 587)
+    )
+    asunto_email: str = "Informe Código Contable"  # Fijo o se puede externalizar
 
     # --- Notificaciones WhatsApp (Twilio) ---
-    twilio_account_sid: str = CREDENCIALES["twilio"]["account_sid"]
-
-    twilio_auth_token: str = CREDENCIALES["twilio"]["auth_token"]
-
-    twilio_whatsapp_number: str = CREDENCIALES["twilio"]["whatsapp_number"]
-
-    whatsapp_destinatario: str = CREDENCIALES["twilio"]["destinatario"]
-
-    # -----NIT Genérico (Match no encontrado) ------------------
-
-    NIT_GENERICO: str = CREDENCIALES["NIT_Generico"]["destinatario"]
+    twilio_account_sid: str = os.getenv("TWILIO_ACCOUNT_SID") or CREDENCIALES.get(
+        "twilio", {}
+    ).get("account_sid", "")
+    twilio_auth_token: str = os.getenv("TWILIO_AUTH_TOKEN") or CREDENCIALES.get(
+        "twilio", {}
+    ).get("auth_token", "")
+    twilio_whatsapp_number: str = os.getenv(
+        "TWILIO_WHATSAPP_NUMBER"
+    ) or CREDENCIALES.get("twilio", {}).get("whatsapp_number", "whatsapp:+14155238886")
+    whatsapp_destinatario: str = os.getenv("TWILIO_DESTINATARIO") or CREDENCIALES.get(
+        "twilio", {}
+    ).get("destinatario", "")
 
     # --- Control de Flujo ---
     enviar_email: bool = True
@@ -115,24 +147,25 @@ class ConfigEntorno:
     directorio_revision: str = "./cola_revision/"
 
     # --- Cuentas PUC Estándar ---
-    puc_banco: str = "11100501"  # Bancos cuentas corrientes
-    puc_gasto_gmf: str = "511595"  # Gravamen Movimiento Financiero (4x1000)
-    puc_clientes_default: str = "13050501"  # Clientes nacionales
-    puc_proveedores_default: str = "22050501"  # Proveedores nacionales
+    puc_banco: str = "11100501"
+    puc_gasto_gmf: str = "511595"
+    puc_clientes_default: str = "13050501"
+    puc_proveedores_default: str = "22050501"
 
 
 # ============================================================
-# DICCIONARIOS MAESTROS (Nómina, Categorías, Proveedores)
+# DICCIONARIOS MAESTROS (con validación de existencia)
 # ============================================================
-EMPLEADOS = CATALOGOS["empleados"]
+# NIT genérico (ahora en catalogos.json)
+NIT_GENERICO = CATALOGOS.get("nit_generico", {}).get("nit", "999999999")
 
-CATEGORIAS = CATALOGOS["categorias"]
+EMPLEADOS = CATALOGOS.get("empleados", {})
+CATEGORIAS = CATALOGOS.get("categorias", [])
+CATEGORY_KEYWORDS = CATALOGOS.get("category_keywords", {})
+PROVEEDORES_REALES = CATALOGOS.get("proveedores_reales", [])
+ENTIDADES_FINANCIERAS = CATALOGOS.get("entidades_financieras", [])
 
-CATEGORY_KEYWORDS = CATALOGOS["category_keywords"]
-
-PROVEEDORES_CONOCIDOS = CATALOGOS["proveedores_conocidos"]
-
-# Estructurar categorías para coincidencia rápida
+# Estructurar categorías para coincidencia rápida (sin cambios)
 all_keywords = []
 keyword_to_category = {}
 for cat, kws in CATEGORY_KEYWORDS.items():
@@ -387,26 +420,42 @@ def clasificar_transaccion(descripcion: str, umbral: int = 70) -> str:
 
 # --- Punto #2: Extracción Inteligente de Proveedores y Clientes ---
 def extraer_proveedor(descripcion: str, monto: float) -> str:
+    """
+    Extrae el nombre del proveedor/cliente o identifica movimientos financieros.
+    - Si detecta una entidad financiera (banco/pasarela) → retorna 'Movimiento Bancario'.
+    - Si detecta un proveedor real → retorna su nombre.
+    - Si detecta 'frutesa' → retorna 'Frutesa (Ingreso)' o 'Frutesa (Devolución)' según el signo.
+    """
     if not isinstance(descripcion, str) or pd.isna(descripcion):
         return "Desconocido"
 
     desc_lower = descripcion.lower()
-    es_egreso = monto < 0
-    es_ingreso = monto > 0
 
-    mejor_match = process.extractOne(
-        desc_lower, PROVEEDORES_CONOCIDOS, scorer=fuzz.partial_ratio
+    # 1. Primero, identificar si es una entidad financiera (banco/pasarela)
+    match_financiera = process.extractOne(
+        desc_lower, ENTIDADES_FINANCIERAS, scorer=fuzz.partial_ratio
     )
+    if match_financiera and match_financiera[1] >= 80:
+        # Es un movimiento bancario, no un proveedor real
+        return "Movimiento Bancario"
 
-    if mejor_match and mejor_match[1] >= 80:
-        proveedor = mejor_match[0]
-        if es_ingreso and proveedor == "frutesa":
-            return "Frutesa (Ingreso)"
-        elif es_egreso:
-            return proveedor.title()
+    # 2. Buscar en proveedores reales
+    match_proveedor = process.extractOne(
+        desc_lower, PROVEEDORES_REALES, scorer=fuzz.partial_ratio
+    )
+    if match_proveedor and match_proveedor[1] >= 80:
+        proveedor = match_proveedor[0]
+        # Manejo especial para Frutesa (cliente con doble rol)
+        if proveedor == "frutesa":
+            if monto > 0:
+                return "Frutesa (Ingreso)"
+            else:
+                return "Frutesa (Devolución)"
+        # Para otros proveedores reales
         return proveedor.title()
 
-    if es_egreso:
+    # 3. Si no hay match directo, intentar extraer por patrones (solo para egresos)
+    if monto < 0:
         patrones = [
             r"(?:pago\s*a\s*)([a-záéíóúñ\s]+?)(?:\s*ref|\s*$|\.|,)",
             r"(?:compra\s*en\s*)([a-záéíóúñ\s]+?)(?:\s*ref|\s*$|\.|,)",
@@ -419,7 +468,7 @@ def extraer_proveedor(descripcion: str, monto: float) -> str:
                 if len(res) > 2 and res not in ["pago", "compra", "transferencia"]:
                     return res.title()
 
-        # Inferencia inversa por mapeo semántico
+        # Inferencia por palabras clave (mapeo semántico)
         mapa_keyword_proveedor = {
             "protoquimica": "Protoquímica",
             "calcio": "Protoquímica",
@@ -1202,7 +1251,12 @@ def main():
     procesar_excepciones_y_revision(df_banco, config, errores_acumulados)
 
     # --- Paso 6: Agregaciones y Métricas de Negocio ---
-    compras_df = df_banco[df_banco["monto"] < 0]
+    # Filtrar egresos, excluyendo nómina y movimientos bancarios
+    compras_df = df_banco[
+        (df_banco["monto"] < 0)
+        & (df_banco["categoria"] != "Nómina")
+        & (df_banco["proveedor"] != "Movimiento Bancario")
+    ]
     reporte_proveedores = (
         compras_df.groupby("proveedor")
         .agg(

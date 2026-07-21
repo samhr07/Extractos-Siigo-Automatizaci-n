@@ -74,10 +74,16 @@
         "ara",
         "d1",
         "exito",
-        "frutesa",
+        "frutesa"
+    ],
+    "ENTIDADES_FINANCIERAS": [
         "wompi",
         "bancolombia",
         "nequi",
         "nu"
-    ]
+    ],
+    "nit_generico": {
+        "nit": "999999999",
+        "nombre": "SIN IDENTIFICAR"
+    }
 }
