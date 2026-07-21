@@ -1,0 +1,83 @@
+{
+    "empleados": {
+        "William": {
+            "numero": "3182309554",
+            "banco": "Nequi",
+            "tipo": "celular"
+        },
+        "Diana": {
+            "numero": "3133761278",
+            "banco": "Nequi",
+            "tipo": "celular"
+        },
+        "Mabel": {
+            "numero": "3105477761",
+            "banco": "Nequi",
+            "tipo": "celular"
+        },
+        "Hugo": {
+            "numero": "16132028650",
+            "banco": "Bancolombia",
+            "tipo": "cuenta"
+        },
+        "Natalia": {
+            "numero": "10065329940",
+            "banco": "Bancolombia",
+            "tipo": "cuenta"
+        }
+    },
+    "categorias": [
+        "Materia Prima",
+        "Servicios Públicos",
+        "Nómina",
+        "Gastos Administrativos",
+        "Ventas",
+        "Impuestos",
+        "Otros",
+        "Biocompuestos",
+        "Inorgánicos"
+    ],
+    "category_keywords": {
+        "Inorgánicos": [
+            "calcio",
+            "magnesio",
+            "potasio",
+            "costal",
+            "costales",
+            "protoquímica",
+            "alcohol",
+            "hipoclorito",
+            "ozono",
+            "cristalería",
+            "laboratorio",
+            "matraz",
+            "probeta",
+            "tubo de ensayo",
+            "vidrio",
+            "pipeta",
+            "bureta"
+        ],
+        "Biocompuestos": [
+            "extracto de levadura",
+            "levadura",
+            "tecna",
+            "biocompuesto",
+            "peptona",
+            "agar"
+        ],
+        "...": "..."
+    },
+    "proveedores_conocidos": [
+        "protoquimica",
+        "tecna",
+        "incodi",
+        "ara",
+        "d1",
+        "exito",
+        "frutesa",
+        "wompi",
+        "bancolombia",
+        "nequi",
+        "nu"
+    ]
+}

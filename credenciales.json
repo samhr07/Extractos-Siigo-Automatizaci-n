@@ -1,0 +1,23 @@
+{
+    "siigo": {
+        "api_url": "https://api.siigo.com/v1",
+        "username": "samuelhoyos2007@gmail.com",
+        "access_key": "wijf ptwd aihv gphn",
+        "partner_id": "MiScriptConciliacion",
+        "sandbox": true,
+        "timeout": 120
+    },
+    "email": {
+        "remitente": "samuelhoyos2007@gmail.com",
+        "password": "Rexyfiona2007.",
+        "destinatario": "henkabio.adm@gmail.com",
+        "smtp_server": "smtp.gmail.com",
+        "smtp_port": 587
+    },
+    "twilio": {
+        "account_sid": "US5bf4e21d162b0f4521a8436ea85bf530",
+        "auth_token": "07aa11afb99953d2d7f7250fab7790ae",
+        "whatsapp_number": "whatsapp:+14155238886",
+        "destinatario": "whatsapp:+573160470196"
+    }
+}
