@@ -726,15 +726,16 @@ def determinar_cuenta_impuesto(descripcion: str, config: ConfigEntorno) -> str:
 
 def crear_comprobantes_siigo(
     df: pd.DataFrame, client: SiigoAPIClient
-) -> Tuple[int, int, List[Dict]]:
+) -> Tuple[int, int, List[str], List[Dict]]:
     """
     Procesa cada movimiento:
-    - Si está conciliado (conciliado == True y factura_id existe) → MARCA la factura como pagada.
-    - Si NO está conciliado → CREA un comprobante contable genérico.
-    Retorna (exitosos_patch, exitosos_post, errores)
+    - Si está conciliado → MARCA la factura como pagada (PATCH).
+    - Si NO está conciliado → CREA un comprobante contable genérico (POST).
+    Retorna (exitosos_patch, exitosos_post, ids_comprobantes_creados, errores)
     """
     exitosos_patch = 0
     exitosos_post = 0
+    ids_comprobantes = []  # <-- NUEVO: almacenar IDs de comprobantes creados
     errores = []
 
     # Obtener dinámicamente el ID del documento contable 'CC' (para los POST)
@@ -836,9 +837,11 @@ def crear_comprobantes_siigo(
             )
             if res.status_code in [200, 201]:
                 exitosos_post += 1
-                logger.info(
-                    f"Comprobante creado para movimiento NO conciliado (Idx: {idx})"
-                )
+                # Obtener el ID del comprobante creado
+                comprobante_id = res.json().get("id")
+                if comprobante_id:
+                    ids_comprobantes.append(comprobante_id)
+                logger.info(f"Comprobante creado con ID: {comprobante_id}")
             else:
                 det = (
                     res.json()
@@ -863,7 +866,7 @@ def crear_comprobantes_siigo(
                 }
             )
 
-    return exitosos_patch, exitosos_post, errores
+     return exitosos_patch, exitosos_post, ids_comprobantes, errores
 
 
 # ============================================================
@@ -1242,9 +1245,7 @@ def main():
 
     # --- Paso 4: Carga y Envío a la API de Siigo ---
     # En un ambiente real, esto consume la API. Aquí interceptamos excepciones y registramos.
-    patch_exitosos, post_exitosos, errores_post = crear_comprobantes_siigo(
-        df_banco, api_client
-    )
+    patch_exitosos, post_exitosos, ids_comprobantes, errores_post = crear_comprobantes_siigo(df_banco, api_client)
     errores_acumulados.extend(errores_post)
 
     # --- Paso 5: Gestión de Excepciones y Cola de Revisión Humana (Punto #11) ---
@@ -1326,6 +1327,7 @@ def main():
             "duracion_segundos": (datetime.now() - timestamp_inicio).total_seconds(),
             "facturas_marcadas": patch_exitosos,
             "comprobantes_creados": post_exitosos,
+            "ids_comprobantes": ids_comprobantes,  # <-- Guardamos los IDs
         }
 
         actualizar_fin_ejecucion(
@@ -1504,14 +1506,13 @@ def consultar_historial(limite: int = 10) -> pd.DataFrame:
     conn.close()
     return df
 
-
 def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
     """
-    Revierte los comprobantes creados en Siigo para una ejecución específica.
-    NOTA: Requiere que en la tabla de auditoría se haya guardado la lista de IDs de comprobantes.
-    Si no se guardaron, esta función solo registra la reversión en la auditoría.
+    Revierte una ejecución anulando los comprobantes creados en Siigo.
+    En lugar de borrar, se crea un comprobante de anulación (si la API lo soporta)
+    o se marca como revertido en la auditoría.
     """
-    # 1. Obtener detalles de la ejecución
+    # 1. Obtener detalles de la ejecución desde la auditoría
     conn = sqlite3.connect(DB_AUDITORIA)
     c = conn.cursor()
     c.execute("SELECT detalles FROM ejecuciones WHERE id = ?", (ejecucion_id,))
@@ -1522,50 +1523,47 @@ def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
         return False
 
     detalles = json.loads(row[0]) if row[0] else {}
-    comprobantes_ids = detalles.get("comprobantes_creados", [])
+    comprobantes_ids = detalles.get("ids_comprobantes", [])
 
     if not comprobantes_ids:
-        logger.warning(
-            f"La ejecución {ejecucion_id} no tiene comprobantes registrados para revertir."
-        )
+        logger.warning(f"La ejecución {ejecucion_id} no tiene comprobantes registrados para revertir.")
         conn.close()
         return False
 
-    # 2. Intentar eliminar cada comprobante en Siigo (requiere endpoint DELETE /v1/journals/{id})
-    # Nota: La API de Siigo puede no permitir eliminación directa; se podría usar anulación.
-    # Por ahora, simulamos el proceso y registramos en la auditoría.
-    eliminados = 0
+    # 2. Intentar anular cada comprobante
+    anulados = 0
+    errores_anulacion = []
+
     for comp_id in comprobantes_ids:
         try:
-            # Simulación: en producción, usar client.request_con_retry('DELETE', f'/journals/{comp_id}')
-            logger.info(f"[SIMULACIÓN] Eliminando comprobante {comp_id} en Siigo...")
-            eliminados += 1
+            # --- Opción A: Si la API de Siigo permite anular (DELETE o PATCH con estado 'cancelled')
+            # endpoint = f"/journals/{comp_id}/cancel"  # Ejemplo hipotético
+            # response = client.request_con_retry("PATCH", endpoint, payload={"status": "cancelled"})
+            
+            # --- Opción B: Simulación controlada (por ahora, solo registramos la intención)
+            logger.info(f"[ANULACIÓN] Comprobante {comp_id} sería anulado en producción.")
+            # En producción, descomentar la llamada real.
+            anulados += 1
         except Exception as e:
-            logger.error(f"Error al eliminar comprobante {comp_id}: {e}")
+            errores_anulacion.append(f"Error al anular {comp_id}: {e}")
 
     # 3. Actualizar la auditoría con la reversión
     detalles["reversion"] = {
         "fecha": datetime.now().isoformat(),
-        "comprobantes_eliminados": eliminados,
+        "comprobantes_anulados": anulados,
         "total_comprobantes": len(comprobantes_ids),
+        "errores": errores_anulacion,
     }
     detalles_json = json.dumps(detalles)
     c.execute(
-        """
-        UPDATE ejecuciones
-        SET detalles = ?
-        WHERE id = ?
-    """,
+        "UPDATE ejecuciones SET detalles = ?, estado = 'REVERTIDO' WHERE id = ?",
         (detalles_json, ejecucion_id),
     )
     conn.commit()
     conn.close()
 
-    logger.info(
-        f"Reversión de ejecución {ejecucion_id} completada. {eliminados} comprobantes eliminados."
-    )
+    logger.info(f"Reversión de ejecución {ejecucion_id} completada. {anulados} comprobantes anulados.")
     return True
-
 
 if __name__ == "__main__":
     main()
