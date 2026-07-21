@@ -103,6 +103,10 @@ class ConfigEntorno:
 
     whatsapp_destinatario: str = CREDENCIALES["twilio"]["destinatario"]
 
+    # -----NIT Genérico (Match no encontrado) ------------------
+
+    NIT_GENERICO: str = CREDENCIALES["NIT_Generico"]["destinatario"]
+
     # --- Control de Flujo ---
     enviar_email: bool = True
     enviar_whatsapp: bool = True
@@ -645,7 +649,7 @@ def determinar_cuenta_impuesto(descripcion: str, config: ConfigEntorno) -> str:
 
 
 def crear_comprobantes_siigo(
-    df: pd.DataFrame, client: SiigoAPIClient
+    df: pd.DataFrame, client: SiigoAPIClient, self
 ) -> Tuple[int, List[Dict]]:
     """
     Inserta movimientos en Siigo utilizando el recurso /v1/journals con validación de partida doble (Páginas 6 y 7).
@@ -678,17 +682,18 @@ def crear_comprobantes_siigo(
         monto = row["monto"]
         desc = row["descripcion"][:200]
         nit_contraparte = (
-            row["nit_cliente"] if pd.notna(row["nit_cliente"]) else "800123456-0"
+            row["nit_cliente"] if pd.notna(row["nit_cliente"]) else self.NIT_GENERICO
         )
 
-        # Estructuración de la Partida Doble (Ecuación patrimonial debe sumar 0)
-        # Línea de Banco (Cuenta Corriente)
+        # Construcción de la línea de Banco (siempre va con la cuenta de banco)
         linea_banco = {
             "account": {"code": client.config.puc_banco},
-            "customer": {"identification": nit_contraparte},
             "description": desc,
-            "value": monto,  # Convención (positivo: Entrada, negativo: Salida)
+            "value": monto,  # positivo: ingreso, negativo: egreso
         }
+        # Solo añadir customer si tenemos NIT
+        if nit_contraparte:
+            linea_banco["customer"] = {"identification": nit_contraparte}
 
         # Línea de Contraparte (Ingreso, Gasto o Proveedor)
         # Línea de Contraparte (Definición de Gasto/Costo o Ingreso/Pasivo)
@@ -698,7 +703,9 @@ def crear_comprobantes_siigo(
             if row["categoria"] == "Nómina":
                 cuenta_contraparte = "51050601"  # Sueldos
             elif row["categoria"] == "Impuestos":
-                cuenta_contraparte = client.config.puc_gasto_gmf  # 511595
+                cuenta_contraparte = determinar_cuenta_impuesto(
+                    row["descripcion"], client.config
+                )
             elif row["categoria"] in ["Materia Prima", "Biocompuestos", "Inorgánicos"]:
                 cuenta_contraparte = "71050501"  # Materia prima (Costo de producción)
             elif row["categoria"] == "Servicios Públicos":
@@ -724,10 +731,12 @@ def crear_comprobantes_siigo(
 
         linea_contraparte = {
             "account": {"code": cuenta_contraparte},
-            "customer": {"identification": nit_contraparte},
             "description": desc,
-            "value": -monto,  # Se invierte el signo para balancear a cero
+            "value": -monto,  # Invertido para balancear a cero
         }
+        # Solo añadir customer si tenemos NIT
+        if nit_contraparte:
+            linea_contraparte["customer"] = {"identification": nit_contraparte}
 
         payload = {
             "document": {"id": doc_id},
@@ -1464,3 +1473,52 @@ def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
 
 if __name__ == "__main__":
     main()
+
+
+"""
+def crear_tercero_generico(client: SiigoAPIClient) -> Optional[str]:
+    
+    #Crea el tercero 'SIN IDENTIFICAR' en Siigo si no existe.
+    #Retorna el ID del tercero creado o existente.
+    
+    # 1. Primero verificamos si ya existe para no duplicar
+    try:
+        response = client.request_con_retry("GET", "/customers", params={"identification": "999999999"})
+        if response.status_code == 200:
+            customers = response.json()
+            if customers:
+                # Si ya existe, retornamos su ID
+                logger.info("El tercero SIN IDENTIFICAR ya existe en Siigo.")
+                return customers[0].get("id")
+    except Exception as e:
+        logger.warning(f"No se pudo verificar existencia del tercero genérico: {e}")
+
+    # 2. Si no existe, lo creamos
+    logger.info("Creando tercero genérico 'SIN IDENTIFICAR' en Siigo...")
+    payload = {
+        "identification": "999999999",
+        "type_identification": "NIT",
+        "name": "SIN IDENTIFICAR",
+        "commercial_name": "SIN IDENTIFICAR",
+        "address": {
+            "address": "Calle 1 # 1 - 1",
+            "city": {"id": 1},  # Ajusta según tu ciudad (ej. 1 para Bogotá)
+            "country": {"code": "CO"}
+        },
+        "phone": "0000000",
+        "email": "sin@identificar.com"
+    }
+    
+    try:
+        response = client.request_con_retry("POST", "/customers", payload=payload)
+        if response.status_code in [200, 201]:
+            data = response.json()
+            logger.info(f"Tercero genérico creado con ID: {data.get('id')}")
+            return data.get("id")
+        else:
+            logger.error(f"Error al crear tercero genérico: {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Excepción al crear tercero genérico: {e}")
+        return None
+"""
