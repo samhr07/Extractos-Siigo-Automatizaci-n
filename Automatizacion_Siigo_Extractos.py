@@ -10,6 +10,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple, Optional
+import json
 
 # Librerías de análisis y visualización
 import pandas as pd
@@ -43,6 +44,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SiigoOrquestador")
 
+from pathlib import Path
+import json
+
+BASE_DIR = Path(__file__).resolve().parent
+
+CONFIG_DIR = BASE_DIR / "config"
+
+
+def cargar_json(nombre):
+
+    ruta = CONFIG_DIR / nombre
+
+    with open(ruta, "r", encoding="utf-8") as archivo:
+        return json.load(archivo)
+
+
+CREDENCIALES = cargar_json("credenciales.json")
+
+CATALOGOS = cargar_json("catalogos.json")
+
 
 # ============================================================
 # CONFIGURACIÓN GENERAL Y VARIABLES DE ENTORNO (Dataclass)
@@ -50,64 +71,37 @@ logger = logging.getLogger("SiigoOrquestador")
 @dataclass
 class ConfigEntorno:
     # --- Siigo API ---
-    siigo_api_url: str = field(
-        default_factory=lambda: os.getenv("SIIGO_API_URL", "https://api.siigo.com/v1")
-    )
-    siigo_username: str = field(
-        default_factory=lambda: os.getenv("SIIGO_USERNAME", "samuelhoyos2007@gmail.com")
-    )
-    siigo_access_key: str = field(
-        default_factory=lambda: os.getenv("SIIGO_ACCESS_KEY", "wijf ptwd aihv gphn")
-    )
-    siigo_partner_id: str = field(
-        default_factory=lambda: os.getenv("SIIGO_PARTNER_ID", "MiScriptConciliacion")
-    )
-    is_sandbox: bool = field(
-        default_factory=lambda: os.getenv("SIIGO_SANDBOX", "true").lower() == "true"
-    )
-    timeout_siigo: int = 120  # Timeout estricto de 120 segundos
+    siigo_api_url: str = CREDENCIALES["siigo"]["api_url"]
+
+    siigo_username: str = CREDENCIALES["siigo"]["username"]
+
+    siigo_access_key: str = CREDENCIALES["siigo"]["access_key"]
+
+    siigo_partner_id: str = CREDENCIALES["siigo"]["partner_id"]
+
+    is_sandbox: str = CREDENCIALES["siigo"]["sandbox"]
+
+    timeout_siigo: str = CREDENCIALES["siigo"]["timeout"]
 
     # --- Notificaciones Email ---
-    email_remitente: str = field(
-        default_factory=lambda: os.getenv(
-            "EMAIL_REMITENTE", "samuelhoyos2007@gmail.com"
-        )
-    )
-    email_password: str = field(
-        default_factory=lambda: os.getenv("EMAIL_PASSWORD", "Rexyfiona2007.")
-    )
-    email_destinatario: str = field(
-        default_factory=lambda: os.getenv(
-            "EMAIL_DESTINATARIO", "henkabio.adm@gmail.com"
-        )
-    )
-    smtp_server: str = field(
-        default_factory=lambda: os.getenv("SMTP_SERVER", "smtp.gmail.com")
-    )
-    smtp_port: int = field(default_factory=lambda: int(os.getenv("SMTP_PORT", "587")))
-    asunto_email: str = "Informe Código Contable"
+    email_remitente: str = CREDENCIALES["email"]["remitente"]
+
+    email_password: str = CREDENCIALES["email"]["password"]
+
+    email_destinatario: str = CREDENCIALES["email"]["destinatario"]
+
+    smtp_server: str = CREDENCIALES["email"]["smtp_server"]
+
+    smtp_port: str = CREDENCIALES["email"]["smtp_port"]
 
     # --- Notificaciones WhatsApp (Twilio) ---
-    twilio_account_sid: str = field(
-        default_factory=lambda: os.getenv(
-            "TWILIO_ACCOUNT_SID", "US5bf4e21d162b0f4521a8436ea85bf530"
-        )
-    )
-    twilio_auth_token: str = field(
-        default_factory=lambda: os.getenv(
-            "TWILIO_AUTH_TOKEN", "07aa11afb99953d2d7f7250fab7790ae"
-        )
-    )
-    twilio_whatsapp_number: str = field(
-        default_factory=lambda: os.getenv(
-            "TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886"
-        )
-    )
-    whatsapp_destinatario: str = field(
-        default_factory=lambda: os.getenv(
-            "TWILIO_DESTINATARIO", "whatsapp:+573160470196"
-        )
-    )
+    twilio_account_sid: str = CREDENCIALES["twilio"]["account_sid"]
+
+    twilio_auth_token: str = CREDENCIALES["twilio"]["auth_token"]
+
+    twilio_whatsapp_number: str = CREDENCIALES["twilio"]["whatsapp_number"]
+
+    whatsapp_destinatario: str = CREDENCIALES["twilio"]["destinatario"]
 
     # --- Control de Flujo ---
     enviar_email: bool = True
@@ -126,141 +120,13 @@ class ConfigEntorno:
 # ============================================================
 # DICCIONARIOS MAESTROS (Nómina, Categorías, Proveedores)
 # ============================================================
-EMPLEADOS = {
-    "William": {"numero": "3182309554", "banco": "Nequi", "tipo": "celular"},
-    "Diana": {"numero": "3133761278", "banco": "Nequi", "tipo": "celular"},
-    "Mabel": {"numero": "3105477761", "banco": "Nequi", "tipo": "celular"},
-    "Hugo": {"numero": "16132028650", "banco": "Bancolombia", "tipo": "cuenta"},
-    "Natalia": {"numero": "10065329940", "banco": "Bancolombia", "tipo": "cuenta"},
-}
+EMPLEADOS = CATALOGOS["empleados"]
 
-CATEGORIAS = [
-    "Materia Prima",
-    "Servicios Públicos",
-    "Nómina",
-    "Gastos Administrativos",
-    "Ventas",
-    "Impuestos",
-    "Otros",
-    "Biocompuestos",
-    "Inorgánicos",
-]
+CATEGORIAS = CATALOGOS["categorias"]
 
-CATEGORY_KEYWORDS = {
-    "Inorgánicos": [
-        "calcio",
-        "magnesio",
-        "potasio",
-        "costal",
-        "costales",
-        "protoquímica",
-        "alcohol",
-        "hipoclorito",
-        "ozono",
-        "cristalería",
-        "laboratorio",
-        "matraz",
-        "probeta",
-        "tubo de ensayo",
-        "vidrio",
-        "pipeta",
-        "bureta",
-    ],
-    "Biocompuestos": [
-        "extracto de levadura",
-        "levadura",
-        "tecna",
-        "biocompuesto",
-        "peptona",
-        "agar",
-    ],
-    "Materia Prima": [
-        "panela",
-        "ara",
-        "d1",
-        "éxito",
-        "supermercado",
-        "envase",
-        "envases",
-        "incodi",
-        "insumo",
-        "producción",
-        "melaza",
-        "azúcar",
-    ],
-    "Nómina": [
-        "william",
-        "alexander",
-        "mábel",
-        "mabel",
-        "bolivar",
-        "hugo",
-        "diana",
-        "salario",
-        "sueldo",
-        "prestaciones",
-        "nómina",
-        "seguridad social",
-        "arl",
-        "cesantías",
-        "prima",
-        "vacaciones",
-    ],
-    "Servicios Públicos": [
-        "agua",
-        "luz",
-        "electricidad",
-        "gas",
-        "telefonía",
-        "internet",
-        "acueducto",
-        "alcantarillado",
-        "aseo",
-    ],
-    "Gastos Administrativos": [
-        "papelería",
-        "oficina",
-        "tinta",
-        "mensajería",
-        "transporte",
-        "resma",
-        "caja",
-        "grapas",
-    ],
-    "Impuestos": [
-        "4x1000",
-        "gmf",
-        "gravamen",
-        "iva",
-        "renta",
-        "retefuente",
-        "reteica",
-        "reteiva",
-    ],
-    "Ventas": [
-        "facturación",
-        "cliente",
-        "venta",
-        "ingreso",
-        "consignación",
-        "recibo",
-        "pago cliente",
-    ],
-}
+CATEGORY_KEYWORDS = CATALOGOS["category_keywords"]
 
-PROVEEDORES_CONOCIDOS = [
-    "protoquimica",
-    "tecna",
-    "incodi",
-    "ara",
-    "d1",
-    "exito",
-    "frutesa",
-    "wompi",
-    "bancolombia",
-    "nequi",
-    "nu",
-]
+PROVEEDORES_CONOCIDOS = CATALOGOS["proveedores_conocidos"]
 
 # Estructurar categorías para coincidencia rápida
 all_keywords = []
@@ -744,6 +610,40 @@ def conciliar_y_asociar(
     return df
 
 
+def determinar_cuenta_impuesto(descripcion: str, config: ConfigEntorno) -> str:
+    """
+    Retorna el código PUC adecuado para una transacción de impuestos
+    según la descripción (GMF, retenciones, IVA, etc.).
+    """
+    desc_lower = descripcion.lower()
+
+    # --- GMF (Gasto) ---
+    if any(p in desc_lower for p in ["4x1000", "gmf", "gravamen"]):
+        return config.puc_gasto_gmf  # 511595
+
+    # --- Retención en la fuente (Pasivo) ---
+    if "retefuente" in desc_lower or "retencion en la fuente" in desc_lower:
+        # Por defecto usamos la cuenta de retención en compras 2.5%
+        # (puedes cambiarla según tu catálogo)
+        return "23654001"  # Retención por compras 2.5%
+
+    # --- Retención de IVA (Pasivo) ---
+    if "reteiva" in desc_lower or "iva retenido" in desc_lower:
+        return "23670101"  # Impuesto a las ventas retenido 15%
+
+    # --- Retención de ICA (Pasivo) ---
+    if "reteica" in desc_lower or "industria y comercio retenido" in desc_lower:
+        return "23680501"  # Reteica 11.04 (por defecto)
+
+    # --- IVA por pagar (Pasivo) ---
+    if "iva" in desc_lower:
+        # Si es un pago de IVA a la DIAN, usamos IVA generado en ventas
+        return "24080501"  # Iva generado en ventas
+
+    # Fallback: si no se reconoce, se asume GMF (gasto)
+    return config.puc_gasto_gmf
+
+
 def crear_comprobantes_siigo(
     df: pd.DataFrame, client: SiigoAPIClient
 ) -> Tuple[int, List[Dict]]:
@@ -791,18 +691,36 @@ def crear_comprobantes_siigo(
         }
 
         # Línea de Contraparte (Ingreso, Gasto o Proveedor)
-        if row["categoria"] == "Nómina":
-            cuenta_contraparte = "51050601"  # Sueldos
-        elif row["categoria"] == "Impuestos":
-            cuenta_contraparte = client.config.puc_gasto_gmf
-        elif row["categoria"] == "Ventas":
-            cuenta_contraparte = "41350501"  # Comercio
-        else:
-            cuenta_contraparte = (
-                client.config.puc_proveedores_default
-                if monto < 0
-                else client.config.puc_clientes_default
-            )
+        # Línea de Contraparte (Definición de Gasto/Costo o Ingreso/Pasivo)
+        # --- 1. Manejo de Egresos (Gastos y Costos) ---
+        if monto < 0:
+            # Mapeo de categorías de gasto a cuentas de RESULTADO (PUC real)
+            if row["categoria"] == "Nómina":
+                cuenta_contraparte = "51050601"  # Sueldos
+            elif row["categoria"] == "Impuestos":
+                cuenta_contraparte = client.config.puc_gasto_gmf  # 511595
+            elif row["categoria"] in ["Materia Prima", "Biocompuestos", "Inorgánicos"]:
+                cuenta_contraparte = "71050501"  # Materia prima (Costo de producción)
+            elif row["categoria"] == "Servicios Públicos":
+                cuenta_contraparte = (
+                    "51359501"  # Servicios - Otros (Gasto administrativo)
+                )
+            elif row["categoria"] == "Gastos Administrativos":
+                cuenta_contraparte = "51953001"  # Útiles papelería y fotocopias
+            else:
+                # Para "Otros" o cualquier categoría no mapeada, usamos una cuenta de gasto diverso
+                # para evitar contaminar el pasivo.
+                cuenta_contraparte = (
+                    "51999999"  # Pregúntale a tu contador (Gasto diverso)
+                )
+
+        # --- 2. Manejo de Ingresos (Ventas y Otros Ingresos) ---
+        else:  # monto > 0
+            if row["categoria"] == "Ventas":
+                cuenta_contraparte = "41350501"  # Comercio (Ingreso)
+            else:
+                # Para ingresos no clasificados (ej. reintegros, devoluciones) va a Clientes
+                cuenta_contraparte = client.config.puc_clientes_default  # 13050501
 
         linea_contraparte = {
             "account": {"code": cuenta_contraparte},
