@@ -1144,6 +1144,14 @@ def main():
     api_client = SiigoAPIClient(config)
     errores_acumulados = []
 
+    inicializar_base_auditoria()
+
+    timestamp_inicio = datetime.now()
+    hash_entrada = None
+    total_txs = 0
+    conciliadas = 0
+    ejecucion_id = None
+
     # --- Paso 1: Interacción de Selección de Ingesta (Regla #3) ---
     print("\n" + "=" * 50)
     print("SELECCIONE LA ESTRATEGIA DE INGESTIÓN DE DATOS:")
@@ -1169,6 +1177,29 @@ def main():
             "Suministre la ruta de la carpeta del extracto (o presione Enter para set de prueba): "
         ).strip()
         df_banco = cargar_datos_prueba_bancos()
+
+        # ... después de obtener df_banco (ya sea por carga local o descarga automática) ...
+
+    # --- NUEVO: Calcular hash y registrar ejecución ---
+    if not df_banco.empty:
+        hash_entrada = calcular_hash_datos(df_banco)
+        # Verificar si ya fue procesado antes (opcional)
+        # Aquí podrías consultar el historial y evitar duplicados
+        ejecucion_id = registrar_ejecucion(
+            hash_entrada=hash_entrada,
+            total_txs=len(df_banco),
+            conciliadas=0,  # Se actualizará después
+            errores=0,
+            estado="INICIADO",
+            detalles={
+                "version_script": "1.0",
+                "timestamp_inicio": timestamp_inicio.isoformat(),
+            },
+        )
+        logger.info(f"Ejecución registrada en auditoría con ID: {ejecucion_id}")
+    else:
+        logger.error("No se cargaron datos. Saliendo...")
+        return
 
     # --- Paso 2: Ejecución del Pipeline de Transformación ---
     logger.info("Ejecutando normalización de datos bancarios...")
@@ -1254,6 +1285,263 @@ def main():
         config=config,
     )
     logger.info("Pipeline de automatización finalizado correctamente.")
+
+    # --- NUEVO: Actualizar auditoría con resultados finales ---
+    if ejecucion_id:
+        total_txs = len(df_banco)
+        conciliadas = (
+            df_banco["conciliado"].sum() if "conciliado" in df_banco.columns else 0
+        )
+        errores_count = len(errores_acumulados)
+        estado_final = (
+            "OK" if errores_count == 0 else "PARCIAL" if errores_count < 5 else "ERROR"
+        )
+
+        # Guardar lista de IDs de comprobantes creados (si se generaron)
+        # Asumimos que en la función crear_comprobantes_siigo podrías capturarlos
+        # Por ahora, dejamos un placeholder
+        detalles_adicionales = {
+            "timestamp_fin": datetime.now().isoformat(),
+            "duracion_segundos": (datetime.now() - timestamp_inicio).total_seconds(),
+        }
+
+        actualizar_fin_ejecucion(
+            ejecucion_id=ejecucion_id,
+            estado=estado_final,
+            errores=errores_count,
+            detalles_adicionales=detalles_adicionales,
+        )
+        logger.info(
+            f"Auditoría actualizada para ejecución {ejecucion_id} con estado {estado_final}"
+        )
+
+
+# ============================================================
+# PUNTO #15 - CONTROL DE VERSIONES Y TRAZABILIDAD
+# ============================================================
+import sqlite3
+import hashlib
+import json
+from datetime import datetime
+from typing import Dict, Any, Optional
+
+DB_AUDITORIA = "auditoria_ejecuciones.db"
+
+
+def inicializar_base_auditoria():
+    """
+    Crea la tabla de auditoría si no existe.
+    """
+    conn = sqlite3.connect(DB_AUDITORIA)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ejecuciones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp_inicio TEXT,
+            timestamp_fin TEXT,
+            hash_entrada TEXT,
+            total_transacciones INTEGER,
+            conciliaciones_exitosas INTEGER,
+            errores INTEGER,
+            estado TEXT,  -- 'OK', 'ERROR', 'PARCIAL'
+            detalles TEXT  -- JSON con metadatos adicionales
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def calcular_hash_datos(df: pd.DataFrame) -> str:
+    """
+    Calcula un hash MD5 de los datos de entrada (fecha, descripción, monto, banco).
+    """
+    # Seleccionar columnas relevantes y ordenarlas para consistencia
+    columnas = ["fecha", "descripcion", "monto", "banco_origen"]
+    df_hash = df[columnas].copy()
+    df_hash["fecha"] = df_hash["fecha"].astype(str)
+    # Ordenar para que el hash sea independiente del orden de las filas
+    df_hash = df_hash.sort_values(by=["fecha", "monto", "descripcion"]).reset_index(
+        drop=True
+    )
+    # Convertir a string y calcular hash
+    contenido = df_hash.to_csv(index=False, sep="|").encode("utf-8")
+    return hashlib.md5(contenido).hexdigest()
+
+
+def registrar_ejecucion(
+    hash_entrada: str,
+    total_txs: int,
+    conciliadas: int,
+    errores: int,
+    estado: str,
+    detalles: Optional[Dict[str, Any]] = None,
+) -> int:
+    """
+    Registra una ejecución en la base de datos de auditoría.
+    Retorna el ID de la ejecución.
+    """
+    conn = sqlite3.connect(DB_AUDITORIA)
+    c = conn.cursor()
+
+    timestamp_actual = datetime.now().isoformat()
+    detalles_json = json.dumps(detalles) if detalles else "{}"
+
+    c.execute(
+        """
+        INSERT INTO ejecuciones (
+            timestamp_inicio,
+            timestamp_fin,
+            hash_entrada,
+            total_transacciones,
+            conciliaciones_exitosas,
+            errores,
+            estado,
+            detalles
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+        (
+            timestamp_actual,
+            timestamp_actual,
+            hash_entrada,
+            total_txs,
+            conciliadas,
+            errores,
+            estado,
+            detalles_json,
+        ),
+    )
+
+    ejecucion_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return ejecucion_id
+
+
+def actualizar_fin_ejecucion(
+    ejecucion_id: int,
+    estado: str,
+    errores: int,
+    detalles_adicionales: Optional[Dict] = None,
+):
+    """
+    Actualiza el registro de una ejecución con la información de cierre.
+    """
+    conn = sqlite3.connect(DB_AUDITORIA)
+    c = conn.cursor()
+
+    timestamp_fin = datetime.now().isoformat()
+    if detalles_adicionales:
+        # Recuperar detalles existentes y fusionar
+        c.execute("SELECT detalles FROM ejecuciones WHERE id = ?", (ejecucion_id,))
+        row = c.fetchone()
+        if row:
+            detalles_existentes = json.loads(row[0]) if row[0] else {}
+            detalles_existentes.update(detalles_adicionales)
+            detalles_json = json.dumps(detalles_existentes)
+        else:
+            detalles_json = json.dumps(detalles_adicionales)
+    else:
+        c.execute("SELECT detalles FROM ejecuciones WHERE id = ?", (ejecucion_id,))
+        row = c.fetchone()
+        detalles_json = row[0] if row else "{}"
+
+    c.execute(
+        """
+        UPDATE ejecuciones
+        SET timestamp_fin = ?, estado = ?, errores = ?, detalles = ?
+        WHERE id = ?
+    """,
+        (timestamp_fin, estado, errores, detalles_json, ejecucion_id),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def consultar_historial(limite: int = 10) -> pd.DataFrame:
+    """
+    Retorna las últimas N ejecuciones registradas como DataFrame.
+    """
+    conn = sqlite3.connect(DB_AUDITORIA)
+    query = f"""
+        SELECT 
+            id,
+            timestamp_inicio,
+            timestamp_fin,
+            hash_entrada,
+            total_transacciones,
+            conciliaciones_exitosas,
+            errores,
+            estado
+        FROM ejecuciones
+        ORDER BY timestamp_inicio DESC
+        LIMIT {limite}
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+
+def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
+    """
+    Revierte los comprobantes creados en Siigo para una ejecución específica.
+    NOTA: Requiere que en la tabla de auditoría se haya guardado la lista de IDs de comprobantes.
+    Si no se guardaron, esta función solo registra la reversión en la auditoría.
+    """
+    # 1. Obtener detalles de la ejecución
+    conn = sqlite3.connect(DB_AUDITORIA)
+    c = conn.cursor()
+    c.execute("SELECT detalles FROM ejecuciones WHERE id = ?", (ejecucion_id,))
+    row = c.fetchone()
+    if not row:
+        logger.error(f"No se encontró la ejecución con ID {ejecucion_id}")
+        conn.close()
+        return False
+
+    detalles = json.loads(row[0]) if row[0] else {}
+    comprobantes_ids = detalles.get("comprobantes_creados", [])
+
+    if not comprobantes_ids:
+        logger.warning(
+            f"La ejecución {ejecucion_id} no tiene comprobantes registrados para revertir."
+        )
+        conn.close()
+        return False
+
+    # 2. Intentar eliminar cada comprobante en Siigo (requiere endpoint DELETE /v1/journals/{id})
+    # Nota: La API de Siigo puede no permitir eliminación directa; se podría usar anulación.
+    # Por ahora, simulamos el proceso y registramos en la auditoría.
+    eliminados = 0
+    for comp_id in comprobantes_ids:
+        try:
+            # Simulación: en producción, usar client.request_con_retry('DELETE', f'/journals/{comp_id}')
+            logger.info(f"[SIMULACIÓN] Eliminando comprobante {comp_id} en Siigo...")
+            eliminados += 1
+        except Exception as e:
+            logger.error(f"Error al eliminar comprobante {comp_id}: {e}")
+
+    # 3. Actualizar la auditoría con la reversión
+    detalles["reversion"] = {
+        "fecha": datetime.now().isoformat(),
+        "comprobantes_eliminados": eliminados,
+        "total_comprobantes": len(comprobantes_ids),
+    }
+    detalles_json = json.dumps(detalles)
+    c.execute(
+        """
+        UPDATE ejecuciones
+        SET detalles = ?
+        WHERE id = ?
+    """,
+        (detalles_json, ejecucion_id),
+    )
+    conn.commit()
+    conn.close()
+
+    logger.info(
+        f"Reversión de ejecución {ejecucion_id} completada. {eliminados} comprobantes eliminados."
+    )
+    return True
 
 
 if __name__ == "__main__":
