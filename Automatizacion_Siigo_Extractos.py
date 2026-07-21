@@ -614,6 +614,33 @@ def conciliar_y_asociar(
     return df
 
 
+def marcar_factura_pagada(
+    client: SiigoAPIClient, factura_id: str, fecha_pago: str, idempotency_key: str
+) -> bool:
+    """
+    Marca una factura como pagada en Siigo usando PATCH /v1/invoices/{id}.
+    Retorna True si fue exitoso, False en caso contrario.
+    """
+    endpoint = f"/invoices/{factura_id}"
+    payload = {"paid": True, "payment_date": fecha_pago}  # Formato YYYY-MM-DD
+
+    try:
+        response = client.request_con_retry(
+            "PATCH", endpoint, payload=payload, idempotency_key=idempotency_key
+        )
+        if response.status_code in [200, 204]:
+            logger.info(f"Factura {factura_id} marcada como pagada correctamente.")
+            return True
+        else:
+            logger.error(
+                f"Error al marcar factura {factura_id} como pagada: {response.text}"
+            )
+            return False
+    except Exception as e:
+        logger.error(f"Excepción al marcar factura {factura_id} como pagada: {e}")
+        return False
+
+
 def determinar_cuenta_impuesto(descripcion: str, config: ConfigEntorno) -> str:
     """
     Retorna el código PUC adecuado para una transacción de impuestos
@@ -649,15 +676,19 @@ def determinar_cuenta_impuesto(descripcion: str, config: ConfigEntorno) -> str:
 
 
 def crear_comprobantes_siigo(
-    df: pd.DataFrame, client: SiigoAPIClient, self
-) -> Tuple[int, List[Dict]]:
+    df: pd.DataFrame, client: SiigoAPIClient
+) -> Tuple[int, int, List[Dict]]:
     """
-    Inserta movimientos en Siigo utilizando el recurso /v1/journals con validación de partida doble (Páginas 6 y 7).
+    Procesa cada movimiento:
+    - Si está conciliado (conciliado == True y factura_id existe) → MARCA la factura como pagada.
+    - Si NO está conciliado → CREA un comprobante contable genérico.
+    Retorna (exitosos_patch, exitosos_post, errores)
     """
+    exitosos_patch = 0
+    exitosos_post = 0
     errores = []
-    exitosos = 0
 
-    # Obtener dinámicamente el catálogo de documentos contables 'CC' (Página 5)
+    # Obtener dinámicamente el ID del documento contable 'CC' (para los POST)
     doc_id = None
     try:
         response = client.request_con_retry("GET", "/document-types")
@@ -668,73 +699,78 @@ def crear_comprobantes_siigo(
                     break
     except Exception as e:
         logger.warning(
-            f"No se pudo consultar el catálogo de documentos contables. Usando ID mock. Error: {e}"
+            f"No se pudo consultar catálogo de documentos contables. Error: {e}"
         )
 
     if not doc_id:
-        doc_id = 24325  # ID por defecto en Sandbox
+        doc_id = 24325  # Fallback para Sandbox
 
     for idx, row in df.iterrows():
-        # Generar llave de idempotencia criptográfica limpia (Max 30 caracteres) (Página 9)
+        # Generar clave de idempotencia única (para POST y PATCH)
         raw_key = f"{row['fecha'].strftime('%Y%m%d')}_{row['banco_origen']}_{abs(row['monto']):.0f}"
         idempotency_key = hashlib.md5(raw_key.encode()).hexdigest()[:30]
 
+        # --- Caso 1: Movimiento conciliado con factura ---
+        if row.get("conciliado", False) and pd.notna(row.get("factura_id")):
+            factura_id = row["factura_id"]
+            fecha_pago = row["fecha"].strftime("%Y-%m-%d")
+
+            ok = marcar_factura_pagada(client, factura_id, fecha_pago, idempotency_key)
+            if ok:
+                exitosos_patch += 1
+            else:
+                errores.append(
+                    {
+                        "entidad": f"Factura {factura_id}",
+                        "motivo": "Error al marcar como pagada",
+                        "detalle": f"Movimiento: {row['descripcion'][:100]}",
+                    }
+                )
+            continue  # Saltamos a la siguiente fila, no se crea comprobante
+
+        # --- Caso 2: Movimiento NO conciliado → crear comprobante genérico ---
         monto = row["monto"]
         desc = row["descripcion"][:200]
         nit_contraparte = (
-            row["nit_cliente"] if pd.notna(row["nit_cliente"]) else self.NIT_GENERICO
+            row["nit_cliente"] if pd.notna(row["nit_cliente"]) else NIT_GENERICO
         )
 
-        # Construcción de la línea de Banco (siempre va con la cuenta de banco)
+        # Línea de Banco
         linea_banco = {
             "account": {"code": client.config.puc_banco},
             "description": desc,
-            "value": monto,  # positivo: ingreso, negativo: egreso
+            "value": monto,
         }
-        # Solo añadir customer si tenemos NIT
         if nit_contraparte:
             linea_banco["customer"] = {"identification": nit_contraparte}
 
-        # Línea de Contraparte (Ingreso, Gasto o Proveedor)
-        # Línea de Contraparte (Definición de Gasto/Costo o Ingreso/Pasivo)
-        # --- 1. Manejo de Egresos (Gastos y Costos) ---
+        # Línea de Contraparte (determinar cuenta según categoría)
         if monto < 0:
-            # Mapeo de categorías de gasto a cuentas de RESULTADO (PUC real)
             if row["categoria"] == "Nómina":
-                cuenta_contraparte = "51050601"  # Sueldos
+                cuenta_contraparte = "51050601"
             elif row["categoria"] == "Impuestos":
                 cuenta_contraparte = determinar_cuenta_impuesto(
                     row["descripcion"], client.config
                 )
             elif row["categoria"] in ["Materia Prima", "Biocompuestos", "Inorgánicos"]:
-                cuenta_contraparte = "71050501"  # Materia prima (Costo de producción)
+                cuenta_contraparte = "71050501"
             elif row["categoria"] == "Servicios Públicos":
-                cuenta_contraparte = (
-                    "51359501"  # Servicios - Otros (Gasto administrativo)
-                )
+                cuenta_contraparte = "51359501"
             elif row["categoria"] == "Gastos Administrativos":
-                cuenta_contraparte = "51953001"  # Útiles papelería y fotocopias
+                cuenta_contraparte = "51953001"
             else:
-                # Para "Otros" o cualquier categoría no mapeada, usamos una cuenta de gasto diverso
-                # para evitar contaminar el pasivo.
-                cuenta_contraparte = (
-                    "51999999"  # Pregúntale a tu contador (Gasto diverso)
-                )
-
-        # --- 2. Manejo de Ingresos (Ventas y Otros Ingresos) ---
-        else:  # monto > 0
+                cuenta_contraparte = "51999999"
+        else:  # Ingreso
             if row["categoria"] == "Ventas":
-                cuenta_contraparte = "41350501"  # Comercio (Ingreso)
+                cuenta_contraparte = "41350501"
             else:
-                # Para ingresos no clasificados (ej. reintegros, devoluciones) va a Clientes
-                cuenta_contraparte = client.config.puc_clientes_default  # 13050501
+                cuenta_contraparte = client.config.puc_clientes_default
 
         linea_contraparte = {
             "account": {"code": cuenta_contraparte},
             "description": desc,
-            "value": -monto,  # Invertido para balancear a cero
+            "value": -monto,
         }
-        # Solo añadir customer si tenemos NIT
         if nit_contraparte:
             linea_contraparte["customer"] = {"identification": nit_contraparte}
 
@@ -744,14 +780,15 @@ def crear_comprobantes_siigo(
             "items": [linea_banco, linea_contraparte],
         }
 
+        # Intentar crear el comprobante
         try:
             res = client.request_con_retry(
                 "POST", "/journals", payload=payload, idempotency_key=idempotency_key
             )
             if res.status_code in [200, 201]:
-                exitosos += 1
+                exitosos_post += 1
                 logger.info(
-                    f"Comprobante registrado en Siigo con Idempotency-Key: {idempotency_key}"
+                    f"Comprobante creado para movimiento NO conciliado (Idx: {idx})"
                 )
             else:
                 det = (
@@ -763,21 +800,21 @@ def crear_comprobantes_siigo(
                 )
                 errores.append(
                     {
-                        "entidad": f"Registro Siigo - Fila {idx}",
+                        "entidad": f"POST /journals - Fila {idx}",
                         "motivo": f"Código HTTP {res.status_code}",
-                        "detalle": f"Error: {det}",
+                        "detalle": det,
                     }
                 )
         except Exception as e:
             errores.append(
                 {
-                    "entidad": f"Registro Siigo - Fila {idx}",
+                    "entidad": f"POST /journals - Fila {idx}",
                     "motivo": "Excepción en POST",
                     "detalle": str(e),
                 }
             )
 
-    return exitosos, errores
+    return exitosos_patch, exitosos_post, errores
 
 
 # ============================================================
@@ -1156,7 +1193,9 @@ def main():
 
     # --- Paso 4: Carga y Envío a la API de Siigo ---
     # En un ambiente real, esto consume la API. Aquí interceptamos excepciones y registramos.
-    exitosos, errores_post = crear_comprobantes_siigo(df_banco, api_client)
+    patch_exitosos, post_exitosos, errores_post = crear_comprobantes_siigo(
+        df_banco, api_client
+    )
     errores_acumulados.extend(errores_post)
 
     # --- Paso 5: Gestión de Excepciones y Cola de Revisión Humana (Punto #11) ---
@@ -1227,9 +1266,12 @@ def main():
         # Guardar lista de IDs de comprobantes creados (si se generaron)
         # Asumimos que en la función crear_comprobantes_siigo podrías capturarlos
         # Por ahora, dejamos un placeholder
+        # Agregar detalles adicionales
         detalles_adicionales = {
             "timestamp_fin": datetime.now().isoformat(),
             "duracion_segundos": (datetime.now() - timestamp_inicio).total_seconds(),
+            "facturas_marcadas": patch_exitosos,
+            "comprobantes_creados": post_exitosos,
         }
 
         actualizar_fin_ejecucion(
