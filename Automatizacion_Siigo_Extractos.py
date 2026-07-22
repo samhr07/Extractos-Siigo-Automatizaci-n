@@ -11,6 +11,7 @@ from email.mime.multipart import MIMEMultipart
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple, Optional
 import json
+from pathlib import Path
 
 # Librerías de análisis y visualización
 import pandas as pd
@@ -47,9 +48,7 @@ logger = logging.getLogger("SiigoOrquestador")
 # ============================================================
 # CARGA DE CONFIGURACIÓN DESDE JSON CON VALIDACIÓN Y FALLBACK
 # ============================================================
-from pathlib import Path
-import json
-import os
+
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = BASE_DIR / "config"

@@ -67,7 +67,7 @@
         ],
         "...": "..."
     },
-    "proveedores_conocidos": [
+    "proveedores_reales": [
         "protoquimica",
         "tecna",
         "incodi",
@@ -76,7 +76,7 @@
         "exito",
         "frutesa"
     ],
-    "ENTIDADES_FINANCIERAS": [
+    "entidades_financieras": [
         "wompi",
         "bancolombia",
         "nequi",
