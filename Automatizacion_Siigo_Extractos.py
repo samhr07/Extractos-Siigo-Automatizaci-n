@@ -1508,9 +1508,12 @@ def consultar_historial(limite: int = 10) -> pd.DataFrame:
 
 def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
     """
-    Revierte una ejecución anulando los comprobantes creados en Siigo.
-    En lugar de borrar, se crea un comprobante de anulación (si la API lo soporta)
-    o se marca como revertido en la auditoría.
+    Revierte una ejecución creando comprobantes de anulación (reversión)
+    en lugar de eliminar los originales.
+    
+    Para cada comprobante original, se consulta su estructura y se crea
+    un nuevo comprobante con los valores invertidos (signo contrario),
+    referenciando el documento original.
     """
     # 1. Obtener detalles de la ejecución desde la auditoría
     conn = sqlite3.connect(DB_AUDITORIA)
@@ -1530,40 +1533,111 @@ def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
         conn.close()
         return False
 
-    # 2. Intentar anular cada comprobante
-    anulados = 0
-    errores_anulacion = []
+    logger.info(f"Iniciando reversión de {len(comprobantes_ids)} comprobantes...")
+
+    # 2. Obtener el ID del documento contable 'CC' para los comprobantes de reversión
+    doc_id = None
+    try:
+        response = client.request_con_retry("GET", "/document-types")
+        if response.status_code == 200:
+            for doc in response.json():
+                if doc.get("code") == "CC":
+                    doc_id = doc.get("id")
+                    break
+    except Exception as e:
+        logger.warning(f"No se pudo consultar catálogo de documentos contables. Error: {e}")
+
+    if not doc_id:
+        doc_id = 24325  # Fallback para Sandbox
+
+    # 3. Crear comprobantes de reversión
+    reversiones_ids = []
+    errores_reversion = []
 
     for comp_id in comprobantes_ids:
         try:
-            # --- Opción A: Si la API de Siigo permite anular (DELETE o PATCH con estado 'cancelled')
-            # endpoint = f"/journals/{comp_id}/cancel"  # Ejemplo hipotético
-            # response = client.request_con_retry("PATCH", endpoint, payload={"status": "cancelled"})
-            
-            # --- Opción B: Simulación controlada (por ahora, solo registramos la intención)
-            logger.info(f"[ANULACIÓN] Comprobante {comp_id} sería anulado en producción.")
-            # En producción, descomentar la llamada real.
-            anulados += 1
-        except Exception as e:
-            errores_anulacion.append(f"Error al anular {comp_id}: {e}")
+            # --- Paso 3a: Obtener el comprobante original ---
+            logger.info(f"Consultando comprobante original {comp_id}...")
+            response = client.request_con_retry("GET", f"/journals/{comp_id}")
+            if response.status_code != 200:
+                errores_reversion.append(f"Error al obtener comprobante {comp_id}: {response.status_code}")
+                continue
 
-    # 3. Actualizar la auditoría con la reversión
+            original = response.json()
+            items_originales = original.get("items", [])
+            if not items_originales:
+                errores_reversion.append(f"El comprobante {comp_id} no tiene items para revertir.")
+                continue
+
+            # --- Paso 3b: Construir items invertidos ---
+            items_reversion = []
+            for item in items_originales:
+                # Crear una copia del item
+                nuevo_item = item.copy()
+                # Invertir el valor (multiplicar por -1)
+                nuevo_item["value"] = -item.get("value", 0)
+                # Añadir referencia al original en la descripción
+                desc_original = nuevo_item.get("description", "")
+                nuevo_item["description"] = f"REVERSIÓN - ORIGINAL {comp_id}: {desc_original}"[:200]
+                items_reversion.append(nuevo_item)
+
+            # --- Paso 3c: Generar clave de idempotencia para la reversión ---
+            raw_key = f"REV_{comp_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            idempotency_key = hashlib.md5(raw_key.encode()).hexdigest()[:30]
+
+            # --- Paso 3d: Construir payload del comprobante de reversión ---
+            payload_reversion = {
+                "document": {"id": doc_id},
+                "date": datetime.now().strftime("%Y-%m-%d"),  # Fecha actual (puede ser la misma o la actual)
+                "items": items_reversion,
+                "description": f"REVERSIÓN DE COMPROBANTE {comp_id} - EJECUCIÓN {ejecucion_id}",
+            }
+
+            # --- Paso 3e: Enviar POST para crear el comprobante de reversión ---
+            logger.info(f"Creando comprobante de reversión para {comp_id}...")
+            response = client.request_con_retry(
+                "POST",
+                "/journals",
+                payload=payload_reversion,
+                idempotency_key=idempotency_key
+            )
+
+            if response.status_code in [200, 201]:
+                reversal_id = response.json().get("id")
+                reversiones_ids.append(reversal_id)
+                logger.info(f"✅ Comprobante de reversión creado con ID: {reversal_id} (revierte a {comp_id})")
+            else:
+                det = response.json().get("Errors", [{}])[0].get("Message", "Error sin detallar") if response.text else "Respuesta vacía"
+                errores_reversion.append(f"Error al crear reversión para {comp_id}: {det}")
+
+        except Exception as e:
+            errores_reversion.append(f"Excepción al revertir {comp_id}: {e}")
+
+    # 4. Actualizar la auditoría con el resultado de la reversión
     detalles["reversion"] = {
         "fecha": datetime.now().isoformat(),
-        "comprobantes_anulados": anulados,
-        "total_comprobantes": len(comprobantes_ids),
-        "errores": errores_anulacion,
+        "comprobantes_originales": comprobantes_ids,
+        "comprobantes_reversiones_creados": reversiones_ids,
+        "total_originales": len(comprobantes_ids),
+        "total_reversiones_creadas": len(reversiones_ids),
+        "errores": errores_reversion,
     }
     detalles_json = json.dumps(detalles)
+    
+    estado_final = "REVERTIDO" if len(reversiones_ids) == len(comprobantes_ids) else "REVERSION_PARCIAL"
     c.execute(
-        "UPDATE ejecuciones SET detalles = ?, estado = 'REVERTIDO' WHERE id = ?",
-        (detalles_json, ejecucion_id),
+        "UPDATE ejecuciones SET detalles = ?, estado = ? WHERE id = ?",
+        (detalles_json, estado_final, ejecucion_id),
     )
     conn.commit()
     conn.close()
 
-    logger.info(f"Reversión de ejecución {ejecucion_id} completada. {anulados} comprobantes anulados.")
-    return True
+    if reversiones_ids:
+        logger.info(f"Reversión completada. {len(reversiones_ids)} comprobantes de reversión creados.")
+    if errores_reversion:
+        logger.error(f"Errores durante la reversión: {errores_reversion}")
+
+    return len(reversiones_ids) > 0
 
 if __name__ == "__main__":
     main()
