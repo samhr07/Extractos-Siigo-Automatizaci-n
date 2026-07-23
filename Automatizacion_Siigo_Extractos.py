@@ -185,6 +185,11 @@ class SiigoAPIClient:
         self.token_expiry: float = 0.0
 
     def autenticar(self) -> bool:
+
+        if requests is None:
+            logger.error("La librería 'requests' no está instalada.")
+            return False
+
         """Autenticación JWT con validez finita (Página 5)"""
         ahora = time.time()
         if self.token and ahora < self.token_expiry:
@@ -777,24 +782,30 @@ def crear_comprobantes_siigo(
                 )
             continue  # Saltamos a la siguiente fila, no se crea comprobante
 
-        # --- Caso 2: Movimiento NO conciliado → crear comprobante genérico ---
-        monto = row["monto"]
+            # --- Caso 2: Movimiento NO conciliado → crear comprobante genérico ---
+        monto_abs = abs(row["monto"])  # Siempre positivo
         desc = row["descripcion"][:200]
         nit_contraparte = (
             row["nit_cliente"] if pd.notna(row["nit_cliente"]) else NIT_GENERICO
         )
 
+        # Definir naturalezas según el tipo de movimiento
+        es_egreso = row["monto"] < 0
+        movimiento_banco = "Credit" if es_egreso else "Debit"
+        movimiento_contraparte = "Debit" if es_egreso else "Credit"
+
         # Línea de Banco
         linea_banco = {
             "account": {"code": client.config.puc_banco},
             "description": desc,
-            "value": monto,
+            "value": monto_abs,
+            "movement": movimiento_banco,  # <--- CORRECCIÓN CLAVE
         }
         if nit_contraparte:
             linea_banco["customer"] = {"identification": nit_contraparte}
 
-        # Línea de Contraparte (determinar cuenta según categoría)
-        if monto < 0:
+        # Línea de Contraparte (definir cuenta según categoría)
+        if es_egreso:
             if row["categoria"] == "Nómina":
                 cuenta_contraparte = "51050601"
             elif row["categoria"] == "Impuestos":
@@ -818,7 +829,8 @@ def crear_comprobantes_siigo(
         linea_contraparte = {
             "account": {"code": cuenta_contraparte},
             "description": desc,
-            "value": -monto,
+            "value": monto_abs,
+            "movement": movimiento_contraparte,  # <--- CORRECCIÓN CLAVE
         }
         if nit_contraparte:
             linea_contraparte["customer"] = {"identification": nit_contraparte}
@@ -865,7 +877,7 @@ def crear_comprobantes_siigo(
                 }
             )
 
-     return exitosos_patch, exitosos_post, ids_comprobantes, errores
+    return exitosos_patch, exitosos_post, ids_comprobantes, errores
 
 
 # ============================================================
@@ -1244,7 +1256,9 @@ def main():
 
     # --- Paso 4: Carga y Envío a la API de Siigo ---
     # En un ambiente real, esto consume la API. Aquí interceptamos excepciones y registramos.
-    patch_exitosos, post_exitosos, ids_comprobantes, errores_post = crear_comprobantes_siigo(df_banco, api_client)
+    patch_exitosos, post_exitosos, ids_comprobantes, errores_post = (
+        crear_comprobantes_siigo(df_banco, api_client)
+    )
     errores_acumulados.extend(errores_post)
 
     # --- Paso 5: Gestión de Excepciones y Cola de Revisión Humana (Punto #11) ---
@@ -1505,11 +1519,12 @@ def consultar_historial(limite: int = 10) -> pd.DataFrame:
     conn.close()
     return df
 
+
 def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
     """
     Revierte una ejecución creando comprobantes de anulación (reversión)
     en lugar de eliminar los originales.
-    
+
     Para cada comprobante original, se consulta su estructura y se crea
     un nuevo comprobante con los valores invertidos (signo contrario),
     referenciando el documento original.
@@ -1528,7 +1543,9 @@ def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
     comprobantes_ids = detalles.get("ids_comprobantes", [])
 
     if not comprobantes_ids:
-        logger.warning(f"La ejecución {ejecucion_id} no tiene comprobantes registrados para revertir.")
+        logger.warning(
+            f"La ejecución {ejecucion_id} no tiene comprobantes registrados para revertir."
+        )
         conn.close()
         return False
 
@@ -1544,7 +1561,9 @@ def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
                     doc_id = doc.get("id")
                     break
     except Exception as e:
-        logger.warning(f"No se pudo consultar catálogo de documentos contables. Error: {e}")
+        logger.warning(
+            f"No se pudo consultar catálogo de documentos contables. Error: {e}"
+        )
 
     if not doc_id:
         doc_id = 24325  # Fallback para Sandbox
@@ -1559,25 +1578,36 @@ def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
             logger.info(f"Consultando comprobante original {comp_id}...")
             response = client.request_con_retry("GET", f"/journals/{comp_id}")
             if response.status_code != 200:
-                errores_reversion.append(f"Error al obtener comprobante {comp_id}: {response.status_code}")
+                errores_reversion.append(
+                    f"Error al obtener comprobante {comp_id}: {response.status_code}"
+                )
                 continue
 
             original = response.json()
             items_originales = original.get("items", [])
             if not items_originales:
-                errores_reversion.append(f"El comprobante {comp_id} no tiene items para revertir.")
+                errores_reversion.append(
+                    f"El comprobante {comp_id} no tiene items para revertir."
+                )
                 continue
 
             # --- Paso 3b: Construir items invertidos ---
             items_reversion = []
             for item in items_originales:
-                # Crear una copia del item
                 nuevo_item = item.copy()
-                # Invertir el valor (multiplicar por -1)
-                nuevo_item["value"] = -item.get("value", 0)
+                nuevo_item["value"] = item.get("value", 0)
+
+                # CORRECCIÓN: INVERTIR NATURALEZA (Debit <-> Credit)
+                mov_original = item.get("movement", "Debit")
+                nuevo_item["movement"] = (
+                    "Credit" if mov_original == "Debit" else "Debit"
+                )
+
                 # Añadir referencia al original en la descripción
                 desc_original = nuevo_item.get("description", "")
-                nuevo_item["description"] = f"REVERSIÓN - ORIGINAL {comp_id}: {desc_original}"[:200]
+                nuevo_item["description"] = (
+                    f"REVERSIÓN - ORIGINAL {comp_id}: {desc_original}"[:200]
+                )
                 items_reversion.append(nuevo_item)
 
             # --- Paso 3c: Generar clave de idempotencia para la reversión ---
@@ -1585,11 +1615,15 @@ def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
             idempotency_key = hashlib.md5(raw_key.encode()).hexdigest()[:30]
 
             # --- Paso 3d: Construir payload del comprobante de reversión ---
+            # CORRECCIÓN: Usar la misma fecha del original y 'observations' en vez de 'description'
+            fecha_original = original.get("date", datetime.now().strftime("%Y-%m-%d"))
             payload_reversion = {
                 "document": {"id": doc_id},
-                "date": datetime.now().strftime("%Y-%m-%d"),  # Fecha actual (puede ser la misma o la actual)
+                "date": fecha_original,
                 "items": items_reversion,
-                "description": f"REVERSIÓN DE COMPROBANTE {comp_id} - EJECUCIÓN {ejecucion_id}",
+                "observations": f"REVERSIÓN DE COMPROBANTE {comp_id} - EJECUCIÓN {ejecucion_id}"[
+                    :500
+                ],
             }
 
             # --- Paso 3e: Enviar POST para crear el comprobante de reversión ---
@@ -1598,16 +1632,26 @@ def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
                 "POST",
                 "/journals",
                 payload=payload_reversion,
-                idempotency_key=idempotency_key
+                idempotency_key=idempotency_key,
             )
 
             if response.status_code in [200, 201]:
                 reversal_id = response.json().get("id")
                 reversiones_ids.append(reversal_id)
-                logger.info(f"✅ Comprobante de reversión creado con ID: {reversal_id} (revierte a {comp_id})")
+                logger.info(
+                    f"✅ Comprobante de reversión creado con ID: {reversal_id} (revierte a {comp_id})"
+                )
             else:
-                det = response.json().get("Errors", [{}])[0].get("Message", "Error sin detallar") if response.text else "Respuesta vacía"
-                errores_reversion.append(f"Error al crear reversión para {comp_id}: {det}")
+                det = (
+                    response.json()
+                    .get("Errors", [{}])[0]
+                    .get("Message", "Error sin detallar")
+                    if response.text
+                    else "Respuesta vacía"
+                )
+                errores_reversion.append(
+                    f"Error al crear reversión para {comp_id}: {det}"
+                )
 
         except Exception as e:
             errores_reversion.append(f"Excepción al revertir {comp_id}: {e}")
@@ -1622,8 +1666,12 @@ def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
         "errores": errores_reversion,
     }
     detalles_json = json.dumps(detalles)
-    
-    estado_final = "REVERTIDO" if len(reversiones_ids) == len(comprobantes_ids) else "REVERSION_PARCIAL"
+
+    estado_final = (
+        "REVERTIDO"
+        if len(reversiones_ids) == len(comprobantes_ids)
+        else "REVERSION_PARCIAL"
+    )
     c.execute(
         "UPDATE ejecuciones SET detalles = ?, estado = ? WHERE id = ?",
         (detalles_json, estado_final, ejecucion_id),
@@ -1632,11 +1680,14 @@ def revertir_ejecucion(ejecucion_id: int, client: SiigoAPIClient) -> bool:
     conn.close()
 
     if reversiones_ids:
-        logger.info(f"Reversión completada. {len(reversiones_ids)} comprobantes de reversión creados.")
+        logger.info(
+            f"Reversión completada. {len(reversiones_ids)} comprobantes de reversión creados."
+        )
     if errores_reversion:
         logger.error(f"Errores durante la reversión: {errores_reversion}")
 
     return len(reversiones_ids) > 0
+
 
 if __name__ == "__main__":
     main()
