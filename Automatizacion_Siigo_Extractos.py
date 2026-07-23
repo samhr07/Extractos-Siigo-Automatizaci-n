@@ -147,7 +147,7 @@ class ConfigEntorno:
 
     # --- Cuentas PUC Estándar ---
     puc_banco: str = "11100501"
-    puc_gasto_gmf: str = "511595"
+    puc_gasto_gmf: str = "51159501"
     puc_clientes_default: str = "13050501"
     puc_proveedores_default: str = "22050501"
 
